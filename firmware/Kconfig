@@ -1,0 +1,76 @@
+# wakes-sp1 application Kconfig.
+#
+# Pulls in the common USB sample options (CONFIG_SAMPLE_USBD_VID/PID/PRODUCT/...)
+# consumed by the vendored sample_usbd_init helper, then the standard Zephyr tree.
+source "samples/subsys/usb/common/Kconfig.sample_usbd"
+
+menu "wakes-sp1"
+
+config SP1_PLAITS
+	bool "Plaits voice as the audio source (M3)"
+	default y
+	select CPP
+	help
+	  y: PLAY triggers the Plaits voice (2-op FM), faders are FREQUENCY /
+	  TIMBRE / MORPH / HARMONICS, VOL+/- set the output level.
+	  n: the M2 440 Hz test tone instead, with its PLAY / VOL controls, and
+	  none of the Plaits code is compiled or linked.
+
+	  This is the FALLBACK SWITCH. If the voice faults or overruns on hardware,
+	  set CONFIG_SP1_PLAITS=n in prj.conf and rebuild: everything else in the
+	  build (headphone mute, LEDs, power) stays exactly as it was.
+
+config SP1_STRING_VOICES
+	int "String engine: number of strings (Plaits kNumStrings)"
+	range 1 3
+	default 2
+	depends on SP1_PLAITS
+	help
+	  How many strings Plaits' String engine rings at once. Upstream is 3.
+	  Each TRIG plucks the next string round-robin, so this is how many
+	  notes can overlap before the oldest one is re-plucked.
+
+	  2 (default, M3e): every string costs the same, so 2 saves a third of
+	  the engine -- 598.6 -> 427.3 instructions/sample in tools/plaits-bench,
+	  about 90 % -> 65 % of the audio budget on the SP-1. At 3, String
+	  measured 90 % average and 98.5 % peak: it played, with no headroom.
+
+	  Applied at build time to a generated copy of string_engine.h; the
+	  vendored file is not modified (see "Plaits overrides" in
+	  firmware/CMakeLists.txt). Set it to 3 in prj.conf to A/B the original.
+
+config SP1_PARTICLES
+	int "Particle engine: number of particles (Plaits kNumParticles)"
+	range 1 6
+	default 2
+	depends on SP1_PLAITS
+	help
+	  How many resonant "particles" Plaits' Particle engine runs. Upstream
+	  is 6. Plaits divides the density by this count, so the rate of events
+	  is the same; fewer means fewer pings ringing at different pitches at
+	  once.
+
+	  2 (default, M3h): at 3 (M3f) the SP-1 peaked at 83-100 %, all of it
+	  below MORPH centre where the diffuser runs (Adara). Each particle is
+	  ~43 instructions/sample. At 6 (upstream) it measured 86 % average /
+	  97 % peak. The diffuser is skipped above MORPH centre in any case.
+
+config SP1_MODAL_MODES
+	int "Modal engine: number of resonator modes (Plaits kMaxNumModes)"
+	range 4 24
+	default 12
+	depends on SP1_PLAITS
+	help
+	  Partials of Plaits' modal resonator. Upstream is 24. Must be a
+	  multiple of 4 (the resonator renders modes in batches of 4; the build
+	  checks). Fewer modes drop the highest partials: the body of a bell
+	  stays, its shimmer goes.
+
+	  12 (default, M3g): 8 measured 49 % average / 54 % peak on the SP-1
+	  and sounded band-limited (Adara); each batch of 4 modes costs ~100
+	  instructions/sample, ~16 %, so 12 is expected near 65 % / 70 %.
+	  8 is the fallback. 16 would be ~80 % average -- over the target.
+
+endmenu
+
+source "Kconfig.zephyr"

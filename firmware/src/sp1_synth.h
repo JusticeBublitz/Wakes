@@ -1,0 +1,182 @@
+/*
+ * wakes-sp1 — the synth voice (M3): a C interface around the Plaits DSP.
+ *
+ * The DSP is Mutable Instruments Plaits by Emilie Gillet (MIT), vendored unmodified in
+ * third_party/eurorack/. This file and sp1_synth.cc are the only code that touches it.
+ *
+ * ---- threads ----
+ *   sp1_synth_init()          main thread, once, before audio starts
+ *   sp1_synth_render()        AUDIO THREAD ONLY
+ *   everything else           main thread; lock-free hand-off, read once per block
+ *
+ * Parameters are double-buffered (see sp1_synth_set_params). A trigger is a counter
+ * the main thread increments and the audio thread compares, so a press is never lost
+ * and never doubled, whatever the timing.
+ *
+ * ---- M3 scope ----
+ * ONE engine: 2-op FM (Plaits engine index 10, "FM" in Plaits 1.0's bank). All 24 are
+ * compiled in -- Voice::Init sets them all up -- but only FM can be selected until M4.
+ * An engine that overruns the budget makes the audio stutter (see sp1_audio.h); it
+ * does not reset the device.
+ *
+ * Controls: see sp1_plaits_ui.h (pages, pickup, centre detents). This file only
+ * turns a finished sp1_synth_params into Plaits' Patch and Modulations.
+ */
+#ifndef SP1_SYNTH_H
+#define SP1_SYNTH_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Plaits renders in blocks of this many samples; sp1_synth_render() needs a multiple. */
+#define SP1_SYNTH_BLOCK 12u
+
+/* Engine the voice is constructed with, before the UI publishes its first parameters
+ * (plaits/dsp/voice.cc order): virtual analog, the first row of docs/PLAITS-ENGINES.md
+ * (M4). The UI's own start engine comes from that table. */
+#define SP1_SYNTH_ENGINE_INITIAL 8
+
+/* Construct and initialise the voice. Idempotent. */
+void sp1_synth_init(void);
+
+/* AUDIO THREAD. Render `frames` samples of the main output (Plaits OUT) into `out`,
+ * one int16 per frame. `frames` must be a multiple of SP1_SYNTH_BLOCK. */
+void sp1_synth_render(int16_t *out, uint32_t frames);
+
+/* Everything the UI decides, already mapped to Plaits' own units (M3b). The UI layer
+ * (sp1_plaits_ui) owns pages, pickup, centre detents and the octave-range logic; the
+ * synth just renders what it is given. */
+struct sp1_synth_params {
+	float note;                    /* MIDI semitones, final (range mode applied)  */
+	float harmonics, timbre, morph;          /* 0..1                            */
+	/* Attenuverters, -1..+1. HARMONICS' is ours (M4a): Plaits has no attenuverter on
+	 * that input, so voice.{h,cc} are overridden to give it one, with the same
+	 * internal-envelope behaviour as FM / TIMBRE / MORPH. */
+	float timbre_mod, fm_mod, morph_mod, harm_mod;
+	float decay, lpg_colour;                 /* 0..1 (settings page)            */
+	float level;                   /* 0..1, only meaningful if level_patched      */
+	int   level_patched;           /* 0: LPG triggered by PLAY; 1: VCA held open  */
+	int   engine;                  /* Plaits engine index                         */
+	/* Marbles -> Plaits (M4). Applied ONLY while Marbles' clock runs
+	 * (sp1_marbles_running); stopped, every one of these inputs is unpatched. */
+	uint8_t mrb_t_dest[3];         /* t1, t2, t3: enum sp1_mui_dest values         */
+	uint8_t mrb_dest[4];           /* X1, X2, X3, Y: enum sp1_mui_dest values      */
+	/* ---- hold the note between TRIGs (M4e, Adara) ----
+	 * Set while a FREQUENCY scale is selected. `note` above is already quantized by
+	 * sp1_pui_params in the main thread; this asks the AUDIO thread to LATCH it at each
+	 * TRIG edge and use the latched value until the next one.
+	 *
+	 * ⚠️ It has to happen here, not in the UI, because TRIG is only known in the audio
+	 * thread. Without it, moving F1 while a note is still decaying slides that note's
+	 * pitch from degree to degree -- correctly quantized and, as Adara put it, not as
+	 * pleasurable as hoped. With it, F1 chooses the NEXT note.
+	 *
+	 * ⚠️ 0 while no scale is selected: unquantized FREQUENCY stays continuous, which is
+	 * what a fader with no grid should do. */
+	int     note_hold;
+};
+
+/* Publish a complete parameter set. Main thread. The audio thread picks it up at its
+ * next block, whole: two buffers and an index flip, so it can never see half an
+ * update (it outranks main, so it is never interrupted by a writer mid-copy). */
+void sp1_synth_set_params(const struct sp1_synth_params *p);
+
+/* Fire the TRIG input once (RWD pressed). Works whether or not Marbles runs; while it
+ * runs, this and the routed t gates both reach TRIG, and a new edge that lands while
+ * TRIG is already high is re-struck (one 0.25 ms low block) so it is never lost. */
+void sp1_synth_trigger(void);
+
+/* ---- the TRIG burst (M3b; tempo from Marbles since M4; PHASE-LOCKED since M4e) ----
+ * A BURST fires TRIGs at 1/div notes of the tempo for as long as it is held on. Timing is
+ * quantised to Plaits' 12-sample block, 0.25 ms.
+ *
+ * ⚠️ Where the grid comes from depends on whether Marbles' clock is RUNNING (M4e, Adara):
+ *
+ *   stopped -> a free-running accumulator at 1/div of `clock_bpm`, first TRIG on the
+ *              press. There is nothing to lock to, so this is unchanged from M3b.
+ *   running -> the 1/div grid is read off MARBLES' OWN MASTER RAMP
+ *              (sp1_marbles_ramp), so a burst is exact subdivisions of the clock you can
+ *              hear. It cannot drift, however long FFWD is held, and releasing leaves the
+ *              clock exactly where it would have been.
+ *
+ * ⚠️ THE RATE-MULTIPLYING RATCHET IS GONE (M4e). Through M4d, FFWD while running added
+ * semitones to Marbles' RATE, so the master clock really sped up. That is why the rhythm
+ * shifted: multiplying the rate mid-cycle moves the next tick, and releasing leaves the
+ * phase wherever it happened to land -- "desynchronize it, depending on timing of FFWD
+ * press" (Adara). A phase-locked burst cannot do that, because it never touches the
+ * clock.
+ *
+ * ⚠️ So FFWD while running now RE-TRIGGERS the note Marbles is holding rather than making
+ * the SEQUENCE advance faster. That is a real change in what FFWD is: a roll, not an
+ * arpeggio. Driving Marbles' clock at a subdivision instead is written up as Option B in
+ * docs/IDEAS.md and is deliberately NOT built (Adara: a community referendum first).
+ *
+ * ⚠️ The first TRIG of a running burst is quantised to the NEAREST grid point, not fired
+ * on the press: less than half a grid period past a boundary fires now, more than half
+ * waits for the next one. Worst case is half a period -- 31 ms at 1/32 and 120 BPM -- and
+ * it means a burst never lands off the grid it is supposed to define. */
+void sp1_synth_set_tempo(float bpm);
+void sp1_synth_set_burst_div(uint32_t div);
+void sp1_synth_burst(int on);
+uint32_t sp1_synth_burst_count(void);     /* TRIGs fired by bursts, for the log */
+/* Rising edges actually delivered to Plaits' TRIG input since boot, from every
+ * source (RWD, the burst, Marbles' t gates). For the log (M4). */
+uint32_t sp1_synth_trig_edges(void);
+
+/* ---- output select (M3f, UI-SPEC "Output select") ----
+ * Plaits renders two signals per engine, OUT and AUX; this picks what reaches the
+ * codec. Cycled by "••" + T4 on the PLAITS page. Applied from the next Plaits block.
+ *   OUT      Plaits' OUT                         (the default)
+ *   AUX      Plaits' AUX
+ *   SUM      (OUT + AUX) x 0.71 (-3 dB) through a peak limiter with Plaits' own
+ *            constants and ceiling (0.8 of full scale; M3g). Below the ceiling it
+ *            is untouched, so a quiet sum keeps its level
+ *   RING     OUT x AUX x 2, saturated -- the product of two signals near full scale
+ *            is quieter than either; x2 is the UI-SPEC's starting gain. */
+enum sp1_synth_output {
+	SP1_OUT_MAIN = 0,
+	SP1_OUT_AUX,
+	SP1_OUT_SUM,
+	SP1_OUT_RING,
+	SP1_OUT_COUNT
+};
+void sp1_synth_set_output(enum sp1_synth_output o);
+
+/* ---- the soft-clip drive (M4b, Adara) ----
+ * Extra gain PAST the output stage's maximum, into a soft clipper. "••" + VOL+ steps it
+ * up, "••" + VOL- switches the whole stage off (and back on at the last setting), on
+ * either module. Unshifted VOL+/- is still the ordinary output level.
+ *
+ * It sits on Plaits' OUT and AUX separately, BEFORE the ring modulator and before the
+ * OUT+AUX limiter (Adara), so the limiter catches what the clipper produces rather than
+ * the clipper being fed a signal the limiter has already flattened.
+ *
+ * ⚠️ This is a saturator, not a volume control. stmlib::SoftClip is already curving at
+ * x = 1, so full-scale peaks come DOWN (+3 dB of drive maps 1.0 -> 0.91) while quiet
+ * material comes up: it compresses and adds harmonics. Step 0 bypasses the stage
+ * entirely and is bit-identical to having no drive code at all -- not "SoftClip at unity
+ * gain", which would attenuate by ~2.2 dB and colour the sound.
+ *
+ * ---- the steps are UNEVEN (M4e, Adara) ----
+ * +3 / +8 / +15 / +24 dB, not 3 dB apart. Adara wanted "more extreme compression at the
+ * top end" without losing a gentle first setting, so the ramp opens at +3 dB -- a
+ * fattener -- and ends at +24 dB, where most of the waveform is flat and it is a fuzz.
+ * Even 6 dB steps would have reached +24 too, but the bottom of the range would have been
+ * +6 dB and there would be no subtle setting left.
+ *
+ * Changes are slewed across one DMA block. sp1_synth_drive_db() is the table, for the log
+ * and for the UI -- do not recompute step x 3 anywhere. */
+#define SP1_DRIVE_STEPS 5              /* 0 = off, then +3 / +8 / +15 / +24 dB */
+void sp1_synth_set_drive(int step);
+int  sp1_synth_drive(void);
+int  sp1_synth_drive_db(int step);     /* the dB at `step`, 0 at step 0 */
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SP1_SYNTH_H */
