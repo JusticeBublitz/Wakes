@@ -41,7 +41,7 @@
 //         b(k) = a(k) + 2x b(k+1) - b(k+2),   k = N..1
 //         sum  = y(1) b(1) - y(0) b(2)      (y = the recurrence's two seeds)
 //     Identical output up to float rounding (checked on the host against
-//     upstream, see docs/M3F-TEST.md).
+//     upstream).
 //
 //  3. Partial amplitudes are ramped toward the current spectrum every kRampStride
 //     samples instead of upstream's every sample.

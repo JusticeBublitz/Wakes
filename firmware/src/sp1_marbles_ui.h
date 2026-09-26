@@ -1,6 +1,6 @@
 /*
  * wakes-sp1 — the MARBLES pages (M4). Spec: docs/UI-SPEC.md "MARBLES page" and
- * docs/M4-PLAN.md, as agreed with Adara on 2026-09-22.
+ * docs/UI-PAGES.md.
  *
  * Pure C, no Zephyr: main.c feeds it fader counts, the "••" state and decoded button
  * actions; it hands back a finished sp1_marbles_params and the routing into Plaits.

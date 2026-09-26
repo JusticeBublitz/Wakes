@@ -323,8 +323,7 @@ int sp1_controls_init(void)
  * `f1..f4` values in the console's raw lines against the same faders in silence. The
  * shift, divided by the reading and by the meter level, is K. If the shift is under
  * ~5 counts, leave this at 0: the correction would be noise. Do NOT guess a value --
- * the last time a sag number was inferred rather than measured it was wrong by 7x
- * (CLAUDE.md, gotcha 2). */
+ * the last time a sag number was inferred rather than measured it was wrong by 7x. */
 #define SP1_SAG_AUDIO_K   0.0f
 
 static bool fad_compensated;

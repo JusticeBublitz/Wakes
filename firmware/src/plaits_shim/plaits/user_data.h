@@ -13,7 +13,7 @@
 //
 // It shadows the upstream header because firmware/src/plaits_shim is FIRST on the
 // include path (see firmware/CMakeLists.txt). If user data is ever wanted, it belongs
-// on the eMMC, not in internal flash -- see CLAUDE.md, "0xFF000 is never written".
+// on the eMMC, not in internal flash -- see docs/SAFETY.md, "Unresolved: the page at 0xFF000".
 //
 // MIT, like the code it stands in for.
 

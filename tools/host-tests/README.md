@@ -2,7 +2,7 @@
 
 Two test programs that run the **real firmware sources** on a desktop, with no Zephyr and no
 hardware. They exist because most of this firmware's logic is ordinary C and C++ that can be
-proved on a laptop, and because there is exactly one SP-1 (`CLAUDE.md`, rule 0).
+proved on a laptop, and because there is exactly one SP-1 (`docs/SAFETY.md`).
 
 | | what it links | what it checks |
 |---|---|---|

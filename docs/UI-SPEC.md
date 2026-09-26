@@ -642,8 +642,9 @@ stays **disarmed until `••` is released once** after boot.
 ### Save state on shutdown (question 10) — yes. ⏳ NOT BUILT (status 2026-09-22)
 
 Nothing persists yet: every power-off returns every setting to its default. Two docs disagree
-on where it goes — this section says the last app-slot page (`0xFE000`), `CLAUDE.md`
-("Conventions") says eMMC — to be settled in its own milestone, not inside M4.
+on where it goes — this section says the last app-slot page (`0xFE000`), `docs/SAFETY.md`
+("Unresolved: the page at `0xFF000`") says eMMC — to be settled in its own milestone, not
+inside M4.
 
 Possible, and there is a clean place for it that sidesteps the `0xFF000` dispute:
 **carve the last 4 KB page out of the app slot itself.** Shrink `slot0_partition` from

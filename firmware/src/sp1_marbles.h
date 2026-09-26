@@ -4,12 +4,12 @@
  *
  * The DSP is Mutable Instruments Marbles by Emilie Gillet (MIT), vendored unmodified in
  * third_party/eurorack/marbles (random/, ramp/, resources). Only its generators are
- * used: no inputs, no external clock, no UI, no settings storage (docs/M4-PLAN.md).
+ * used: no inputs, no external clock, no UI, no settings storage.
  *
  * ---- the 4 kHz rule ----
  * Marbles runs natively at 32 kHz. Here it runs ONCE PER PLAITS BLOCK (12 samples,
  * 4 kHz), because Plaits reads its modulation and TRIG inputs only once per block --
- * anything faster is thrown away. Host-verified (CLAUDE.md, M4): the same random
+ * anything faster is thrown away. Host-verified: the same random
  * sequence as at 32 kHz; gate edges on a 0.25 ms grid.
  *
  * ---- threads ----
@@ -77,7 +77,7 @@ struct sp1_marbles_params {
 	 * clock ran, so the master clock really sped up -- which moved the beat on press and
 	 * left the phase displaced on release. FFWD is a phase-locked burst now and never
 	 * touches the clock; see sp1_synth.h. Making the SEQUENCE advance at a subdivision
-	 * is docs/IDEAS.md's Option B and is deliberately not built. */
+	 * is a separate idea, parked for a community vote, and deliberately not built. */
 	int   t_range;       /* [B] 0 = x0.25, 1 = x1, 2 = x4                       */
 	int   t_model;       /* [E] 0..5: coin toss, clusters, drums | independent,
 	                      *      divider, three states                          */

@@ -107,14 +107,14 @@ buffer failures and no resets.
    Do not quote a one-window figure as an engine's cost.
 2. **Host-to-hardware projections ran 6–8 points optimistic** for the M3g/M4a-era trims:
    Additive was projected ~61 % and measures 67.4 %; Modal at 12 modes was projected ~65 % and
-   measures 73.0 %. The %-per-instruction calibration in `CLAUDE.md` is derived from Additive's
-   M3f run and evidently does not carry across builds as tightly as assumed. Treat a projection
-   as ±8 points, not ±15 %, and re-measure on hardware before claiming an engine "fits".
+   measures 73.0 %. The %-per-instruction calibration used for these projections is derived
+   from Additive's M3f run and evidently does not carry across builds as tightly as assumed.
+   Treat a projection as ±8 points, not ±15 %, and re-measure on hardware before claiming an
+   engine "fits".
 
 ⚠️ **Ignore the `max` and `ever` columns of the `AUD` line for this purpose.** They reach 170 %+
 in this log, which is engine-change transients and interrupts landing inside a block, not the
-engine's cost — as the M3 notes in `CLAUDE.md` already say. **`avg` is the figure that decides
-whether an engine fits.**
+engine's cost. **`avg` is the figure that decides whether an engine fits.**
 
 ## What each fader does, per engine
 

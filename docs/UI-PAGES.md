@@ -52,8 +52,9 @@ draws while charging: filling from the `••` end toward PLAY.
 ⚠️ **This adds nothing to the power path and takes nothing away from it.** The ON overlay is a
 draw, not a state; the OFF flash happens in `sp1_power_on_hold()`'s early-release branch **after**
 the decision not to power on, with the return value untouched. The 1.5 s power-on hold, the 3 s
-shutdown and the backstop are all unchanged — see rule 5a in `CLAUDE.md`. (The backstop itself
-moved 20 s → **30 s** in M4e, at Adara's request: a threshold change, never a condition.)
+shutdown and the backstop are all unchanged — see the backstop in `sp1_power_tick()`
+(`firmware/src/sp1_power.c`). (The backstop itself moved 20 s → **30 s** in M4e, at Adara's
+request: a threshold change, never a condition.)
 
 ⚠️ The bar is `sp1_led_bar()`, and STANDBY's charge bar now calls the same function, so the two
 pictures cannot drift apart.
@@ -122,7 +123,7 @@ So the combination space is exactly: **`••` + one button**, on either ladder
   changing the rate mid-cycle moves the next tick and releasing leaves the phase displaced.
   ⚠️ So FFWD now **re-triggers** the note Marbles is holding rather than making the sequence
   advance faster: a roll, not an arpeggio. Driving the clock at a subdivision instead is
-  Option B in `docs/IDEAS.md` and is parked for a community vote (Adara).
+  a separate option, parked for a community vote (Adara).
 - **Rip out the cables** = `••` + PLAY held 3 s: a **full patch wipe** of the module on show
   (`docs/DEFAULTS.md` is the spec). On PLAITS: engine → slot 1, the four BASE faders → that
   engine's neutral state (0.5 for a bipolar parameter, 0 for a unipolar one, F1 → centre = C4),

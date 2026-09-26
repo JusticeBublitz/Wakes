@@ -309,7 +309,7 @@ bool sp1_power_on_hold(void)
 			 * goes back to sleep (Adara, M4c): the one piece of information
 			 * worth having from a device that is off.
 			 *
-			 * ⚠️ SAFETY (docs/SAFETY.md, CLAUDE.md rule 5). This branch
+			 * ⚠️ SAFETY (docs/SAFETY.md, rule 4). This branch
 			 * already returned false and the caller already powered off; all
 			 * that changes is a BOUNDED delay in front of it. The loop runs
 			 * a fixed number of iterations, feeds the watchdog on every one,

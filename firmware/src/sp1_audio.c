@@ -41,9 +41,9 @@ static const struct device *const i2c_bus = DEVICE_DT_GET(DT_NODELABEL(i2c0));
 #define TAS2505_ADDR 0x18u
 
 /* ---- speaker-only level trim (M3) ----
- * Measured 2026-09-21 (logs/sp1-20260921-120917.log, M2B-TEST section 4): the speaker
- * starts to distort at the -6 dBFS tone step and is clean at -9; the headphones are
- * clean all the way to 0 dBFS. So the speaker path alone is trimmed by 9 dB, in the
+ * Measured 2026-09-21 (logs/sp1-20260921-120917.log): the speaker starts to distort
+ * at the -6 dBFS tone step and is clean at -9; the headphones are clean all the way
+ * to 0 dBFS. So the speaker path alone is trimmed by 9 dB, in the
  * TAS2505's own DAC volume (page 0, reg 0x41: signed, 0.5 dB steps, 0 = 0 dB), which
  * the CS42L42 headphone path never sees. Digital full scale then lands where the
  * speaker was last heard clean.
@@ -61,8 +61,8 @@ static const struct device *const i2c_bus = DEVICE_DT_GET(DT_NODELABEL(i2c0));
  *
  * ⚠️ A louder class-D stage draws more peak current from the same rail that feeds the
  * ladders and the faders, and rail sag on that rail is this board's known hazard
- * (CLAUDE.md, gotcha 2). Sag from a BUTTON is already rejected or corrected; sag from
- * the amp is a new source and has never been measured. SP1_SAG_AUDIO_K in
+ * (see the sag notes in sp1_controls.c). Sag from a BUTTON is already rejected or
+ * corrected; sag from the amp is a new source and has never been measured. SP1_SAG_AUDIO_K in
  * sp1_controls.c is the knob for it and is 0 until Adara measures it -- see the note
  * there, which says what to look for in the log. */
 #define SP1_SPK_ATTEN_HALF_DB  (-12)

@@ -4,8 +4,7 @@
 // vendored in third_party/eurorack. Compiled with the same flags as Plaits itself
 // (see firmware/CMakeLists.txt), because it instantiates the Voice.
 //
-// Deliberately includes NO Zephyr headers: the DSP layer stays framework-agnostic
-// (CLAUDE.md, "Conventions").
+// Deliberately includes NO Zephyr headers: the DSP layer stays framework-agnostic.
 
 #include "sp1_synth.h"
 #include "sp1_marbles.h"

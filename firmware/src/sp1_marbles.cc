@@ -7,7 +7,7 @@
 // The y-divider ratios below are copied from marbles.cc; the preset scales from
 // marbles/settings.cc (sp1_marbles_scales.inc). Attributed in NOTICE.
 //
-// Deliberately includes NO Zephyr headers (CLAUDE.md, "Conventions").
+// Deliberately includes NO Zephyr headers: the DSP layer stays framework-agnostic.
 
 #include "sp1_marbles.h"
 /* For enum sp1_mui_dest, which INTELLIGENT reads (M4c). sp1_synth.cc includes it for the
@@ -567,6 +567,6 @@ extern "C" const char* sp1_marbles_scale_name(int s) {
 }
 
 // The generators take the sample rate as a parameter; only the external-clock code
-// (ramp_extractor.cc, never called here) hard-codes 32 kHz. See CLAUDE.md, M4.
+// (ramp_extractor.cc, never called here) hard-codes 32 kHz. See sp1_marbles.h, "the 4 kHz rule".
 static_assert(SP1_MARBLES_MAX_FRAMES * 12u == 240u,
               "one Marbles sample per Plaits block of a 240-frame audio block");

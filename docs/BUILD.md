@@ -1,6 +1,6 @@
 # Building wakes-sp1
 
-Windows host (`nexus`). Zephyr **v4.3.1** + Zephyr SDK **0.17.4**, pinned in `west.yml`.
+Windows host. Zephyr **v4.3.1** + Zephyr SDK **0.17.4**, pinned in `west.yml`.
 Workspace: **`W:\wakes-sp1-ws`**.
 
 | | |
@@ -67,8 +67,7 @@ west's manifest and do not survive. `zephyr-patches/README.md` has the details.
 
 ## Where new code tends to break
 
-**What is new in the current milestone lives in `wakes-sp1/CLAUDE.md` → "Where we are".**
-This section is the durable version: the failure modes that recur on this board.
+The failure modes that recur on this board:
 
 | Symptom | Where to look |
 |---|---|
@@ -157,57 +156,11 @@ and **the device will not boot**. Fix that before flashing.
 
 1. <https://solderless.engineering>
 2. USB-C connected
-3. Hold **Track 1 + Track 4** while plugging in (or 3 s while firmware runs). Four track
-   lights solid.
+3. Hold **Track 1 + Track 4** while plugging in. Four track lights solid.
 4. Select `wakes-sp1.bin`, flash, unplug and replug.
 
 That same combination is the **recovery path**, and it lives in the bootloader rather
 than in our firmware, so it works even if our app is completely broken.
-
-Then work through [`M1A-TEST.md`](M1A-TEST.md).
-
-## Hand it to Claude Code
-
-```powershell
-cd W:\wakes-sp1-ws
-claude
-```
-
-Then paste this. **It is deliberately generic and does not need editing per
-milestone** — what milestone we are on, what is new and what is already diagnosed all
-live in `CLAUDE.md`, which Claude Code loads automatically:
-
-> Read CLAUDE.md (this directory and wakes-sp1/), then wakes-sp1/docs/SAFETY.md and
-> wakes-sp1/docs/BUILD.md. The "Current task" section of CLAUDE.md says what is new and
-> unbuilt.
->
-> Rebuild it and fix whatever breaks. When it builds, report the binary size, how it
-> compares to the last build, and confirm from the .map that the image is linked at
-> 0x20000. Then stop — I flash by hand.
-
-Everything that used to be repeated in this prompt is now permanent context:
-
-| What | Where it lives |
-|---|---|
-| Current milestone, what changed, what to watch | `wakes-sp1/CLAUDE.md` → "Where we are" |
-| Build command, quoting, MinGW CMake, the Zephyr patch | `CLAUDE.md` at the workspace root |
-| Constraints that must not be weakened | `wakes-sp1/docs/SAFETY.md` |
-
-**The one line to keep saying: *then stop — I flash by hand.*** Flashing is the only
-irreversible step, and it should not happen inside a debugging session.
-
-### Coming back for another round
-
-| Command | When |
-|---|---|
-| `claude` | **default for a rebuild.** Fresh context, reloads CLAUDE.md |
-| `claude -c` | continue the most recent session in this directory — use mid-debug |
-| `claude -r` | pick from earlier sessions |
-
-**Prefer a fresh `claude` after files have changed outside that session.** A resumed
-session carries its earlier reading of those files in context and can act on what it
-remembers rather than what is now on disk — which is the same stale-copy failure mode the
-two-workspace mess was, just in a context window instead of a filesystem.
 
 ---
 

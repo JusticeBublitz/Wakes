@@ -7,7 +7,7 @@ parameter, rather than inherited.
 
 **Status: decided (Adara) and IMPLEMENTED in M4d.** The ROTC column describes the firmware again.
 The four **REVIEW** notes left in place are the consequences of the decisions, all confirmed by
-Adara; `docs/M4D-TEST.md` is how to check them on hardware.
+Adara.
 
 **Three scopes**, because "default" means three different things on this device:
 

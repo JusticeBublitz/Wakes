@@ -1387,8 +1387,8 @@ int main(void)
 				 *
 				 * ⚠️ So FFWD while running RE-TRIGGERS rather than making the sequence
 				 * advance faster: a roll, not an arpeggio. Driving Marbles' clock at a
-				 * subdivision is Option B in docs/IDEAS.md and is deliberately not
-				 * built. */
+				 * subdivision is a separate idea, parked for a community vote, and is
+				 * deliberately not built. */
 				const bool ffwd = (g_module == SP1_MODULE_PLAITS) &&
 						  sp1_button_held(SP1_BTN_FFWD) && !ffwd_consumed;
 				const bool burst = ffwd;

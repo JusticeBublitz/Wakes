@@ -111,8 +111,8 @@ void sp1_synth_trigger(void);
  *
  * ⚠️ So FFWD while running now RE-TRIGGERS the note Marbles is holding rather than making
  * the SEQUENCE advance faster. That is a real change in what FFWD is: a roll, not an
- * arpeggio. Driving Marbles' clock at a subdivision instead is written up as Option B in
- * docs/IDEAS.md and is deliberately NOT built (Adara: a community referendum first).
+ * arpeggio. Driving Marbles' clock at a subdivision instead is parked for a community vote
+ * and is deliberately NOT built (Adara).
  *
  * ⚠️ The first TRIG of a running burst is quantised to the NEAREST grid point, not fired
  * on the press: less than half a grid period past a boundary fires now, more than half
