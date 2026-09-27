@@ -13,6 +13,7 @@ on:
       - "**"
       # Administrative: nothing the build, the host suites or the checks read.
       - "!**.md"
+      - "!**.pdf"
       - "!LICENSE"
       - "!LICENSES/**"
       - "!NOTICE"
