@@ -3,38 +3,33 @@
        alt="Wakes: a love letter to Mutable Instruments, by Worldwave">
 </p>
 
-Synthesizer firmware for the Teenage Engineering SP-1, the unreleased stem player. It runs
-ports of two Mutable Instruments modules together on the SP-1's own controls:
+Wakes is a synthesizer custom firmware for the Teenage Engineering SP-1, Teenage Engineering's unreleased stem player. 
+It runs two Mutable Instruments modules combined:
 
-- **Plaits**, the voice: 21 of its 24 synthesis engines, one at a time.
-- **Marbles**, random gates and voltages routed into Plaits to sequence it.
+- **Plaits**: A macro-synthesizer voice, featuring multiple sound engines
+- **Marbles**: A playful random sequencer
 
-Unofficial community work. Not affiliated with or endorsed by Teenage Engineering or Mutable
-Instruments. Nothing here is sold. Flashing custom firmware is at your own risk.
+The development of Wakes is unaffiliated with Teenage Engineering or Mutable Instruments.
+IMPORTANT: Flashing custom firmware on the SP-1 is at your own risk. SP-1s are abandonware, they do not have manufacturer support.
 
 ## 📖 Manual
 
-**[Wakes – Manual (PDF)](docs/Wakes%20-%20Manual.pdf)**: every page, every control, and how
-the two modules play together. Start here.
+**[Wakes – Manual (PDF)](docs/Wakes%20-%20Manual.pdf)**: The manual details the layout of each page, with every control and how how to use them, in an aesthetically pleasing and readable format. Once you've installed Wakes on your SP-1, start there.
 
 ## Status
 
-**v0.4.6, pre-release for beta testing.** Tested on a single SP-1 unit. Report problems with
-the bug form under [Issues](https://github.com/Worldwave/Wakes/issues).
+**v0.4.6, pre-release for beta testing.** Report problems with the bug form under [Issues](https://github.com/Worldwave/Wakes/issues).
 
 ## Flashing
 
-Read [`docs/SAFETY.md`](docs/SAFETY.md) first: the SP-1 has no hardware reset pin.
-
 1. Download `wakes-sp1-v0.4.6.bin` from the
    [latest release](https://github.com/Worldwave/Wakes/releases).
-2. Open <https://solderless.engineering> and connect the SP-1 over USB-C.
-3. Hold **Track 1 + Track 4** while plugging in. The four track lights go solid.
-4. Select the `.bin`, flash, then unplug and replug.
+2. Open <https://solderless.engineering>. Hold down **T1+T4** while connecting the SP-1 over USB-C.
+4. Select the `.bin` in Solderless Engineering's page, flash it, and once done, you can unplug.
 
-That Track 1 + Track 4 recovery lives in Teenage Engineering's bootloader, not in Wakes, so it
-works whatever firmware is installed. Wakes never writes below `0x20000`, where the bootloader
-lives, and holding `••` for 30 s always powers the device off.
+The T1+T4 recovery trigger in step 2 lives in Teenage Engineering's bootloader, not in Wakes, so it
+works with whatever firmware is installed. Wakes never writes below `0x20000` (and neither should your CFW's),
+because that's where the bootloader lives.
 
 ## Building
 
@@ -66,7 +61,7 @@ Output: `build/zephyr/wakes-sp1.bin`. The Zephyr patch is required and is lost o
 
 ## Licence
 
-MIT, Copyright (c) 2026 Adara Barami | Worldwave. See [`LICENSE`](LICENSE).
+MIT, Copyright (c) 2026 Worldwave | Adara Barami. See [`LICENSE`](LICENSE).
 
 Plaits, Marbles and stmlib are by Émilie Gillet (MIT), included unmodified in
 `third_party/eurorack/`. The board support builds on chattock/sp1-tape-looper,
