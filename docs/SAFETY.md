@@ -1,8 +1,5 @@
 # Safety rules for SP-1 firmware development
 
-There is **one SP-1** for this project, and **the SP-1 has no hardware reset pin**.
-Every rule below exists because of one of those two facts.
-
 ## The recovery path, and why it can't be taken away
 
 Hold **Track 1 + Track 4** while plugging in USB-C. The four track lights come on
