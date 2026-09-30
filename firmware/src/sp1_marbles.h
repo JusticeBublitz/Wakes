@@ -12,6 +12,15 @@
  * anything faster is thrown away. Host-verified: the same random
  * sequence as at 32 kHz; gate edges on a 0.25 ms grid.
  *
+ * ---- X and Y at 1 kHz (issue #22) ----
+ * t and the master ramp stay at 4 kHz; X1-X3 and Y are generated at 1 kHz, from every
+ * fourth ramp sample, and brought back to 4 kHz. Marbles renders the whole block before
+ * Plaits sees any of it, so nothing is late: a STEPPED output changes on the exact 4 kHz
+ * sample its clock wrapped (host: bit-identical to 4 kHz), and a SMOOTH one is
+ * interpolated between its 1 kHz values. Glides therefore differ from 4 kHz in their
+ * first millisecond or two (host, 120 BPM, STEPS 0.45: 0.19 V worst of a 10 V span,
+ * 0.014 V rms), and more so at very fast clocks. Adara accepted that concession.
+ *
  * ---- threads ----
  *   sp1_marbles_init()                  main, once, before audio starts
  *   sp1_marbles_render(), *_frame()     AUDIO THREAD ONLY (called from sp1_synth)
@@ -152,6 +161,13 @@ float   sp1_marbles_volts(uint32_t j, int k);
  * own accumulator (M4e) -- that is what makes a burst an exact subdivision of the clock
  * you can hear rather than a second oscillator beating against it. */
 float   sp1_marbles_ramp(uint32_t j);
+
+/* The same three, as the arrays themselves (issue #22), for a caller that reads every
+ * frame of a block: gates[j], volts[4 * j + k], ramp[j]. One call per block instead of
+ * five per frame. Valid until the next sp1_marbles_render(). */
+const uint8_t *sp1_marbles_gate_frames(void);
+const float   *sp1_marbles_volt_frames(void);
+const float   *sp1_marbles_ramp_frames(void);
 
 /* ---- main thread: for the LEDs and the play-row clock ---- */
 /* The latest gates / voltages (updated once per audio block). */

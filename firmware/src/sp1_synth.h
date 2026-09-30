@@ -136,7 +136,14 @@ uint32_t sp1_synth_trig_edges(void);
  *            constants and ceiling (0.8 of full scale; M3g). Below the ceiling it
  *            is untouched, so a quiet sum keeps its level
  *   RING     OUT x AUX x 2, saturated -- the product of two signals near full scale
- *            is quieter than either; x2 is the UI-SPEC's starting gain. */
+ *            is quieter than either; x2 is the UI-SPEC's starting gain.
+ *
+ * Since issue #22 the mode is a set of mixing weights applied INSIDE the voice, BEFORE
+ * its one low-pass gate (see the vendored plaits/dsp/voice.h): the chain is
+ * OUT/AUX -> sum or product -> LPG -> drive -> OUT+AUX limiter, then the output level
+ * (sp1_audio.c). Every mode costs the same. OUT, AUX and OUT+AUX sound as before;
+ * OUTxAUX is gated once AFTER the multiply (Adara), where it used to multiply two
+ * gated channels. */
 enum sp1_synth_output {
 	SP1_OUT_MAIN = 0,
 	SP1_OUT_AUX,
@@ -151,9 +158,13 @@ void sp1_synth_set_output(enum sp1_synth_output o);
  * up, "••" + VOL- switches the whole stage off (and back on at the last setting), on
  * either module. Unshifted VOL+/- is still the ordinary output level.
  *
- * It sits on Plaits' OUT and AUX separately, BEFORE the ring modulator and before the
- * OUT+AUX limiter (Adara), so the limiter catches what the clipper produces rather than
- * the clipper being fed a signal the limiter has already flattened.
+ * ONE drive channel since issue #22 (Adara): the output select comes first, so OUT, AUX,
+ * OUT+AUX or OUTxAUX is driven as one signal -- the sum and the ring product distort
+ * together, and the intermodulation that produces is intended. The OUT+AUX limiter
+ * stays AFTER the drive: it bounds what leaves the device. (Through M4e the drive sat on
+ * OUT and AUX separately, before the mix; that cost two clippers and sounded different
+ * in OUT+AUX and OUTxAUX.) The curve is a table (sp1_synth.cc), so other shapes would
+ * cost the same.
  *
  * ⚠️ This is a saturator, not a volume control. stmlib::SoftClip is already curving at
  * x = 1, so full-scale peaks come DOWN (+3 dB of drive maps 1.0 -> 0.91) while quiet
@@ -174,6 +185,27 @@ void sp1_synth_set_output(enum sp1_synth_output o);
 void sp1_synth_set_drive(int step);
 int  sp1_synth_drive(void);
 int  sp1_synth_drive_db(int step);     /* the dB at `step`, 0 at step 0 */
+
+/* ---- where a block's cycles went (issue #22) ----
+ * One number for the whole block cannot say whether an engine, Marbles or our own output
+ * stage is the expensive part, and every optimisation has to be judged against that. So
+ * sp1_synth_render() timestamps its sections from a free-running cycle counter it is
+ * handed -- a pointer, because this layer includes no Zephyr or CMSIS header. NULL (the
+ * default, and the host) turns the profile off and every figure reads 0.
+ *
+ *   mrb    Marbles' generators (sp1_marbles_render)
+ *   eng    plaits::Voice::Render -- the engine, its LPG and Plaits' own limiter
+ *   post   the drive, the output select and its limiter, the conversion to int16
+ *   total  the whole call; total - mrb - eng - post is the routing between them
+ *
+ * An interrupt landing inside a section is counted in it: these are wall-clock spans.
+ * About 45 counter reads per DMA block, under 0.1 % of the budget. */
+struct sp1_synth_profile {
+	uint32_t total, mrb, eng, post;
+};
+void sp1_synth_set_cycle_counter(const volatile uint32_t *counter);
+/* AUDIO THREAD: the spans of the last sp1_synth_render() call. */
+void sp1_synth_last_profile(struct sp1_synth_profile *out);
 
 
 #ifdef __cplusplus

@@ -131,21 +131,82 @@ int output_prev = SP1_OUT_MAIN;               // audio thread
 // release 0.00002 per sample) and Plaits' ceiling (0.8 of full scale). Unlike
 // Plaits' limiter it applies no gain below the ceiling, so a quiet sum is untouched.
 // Audio thread only; runs only while OUT+AUX is selected (or being faded to/from).
-const float kSumGain = 0.7071f / 32768.0f;   // -3 dB, int16 -> +-1
+//
+// Issue #22: `kSumCeiling / sum_peak` was a float DIVIDE on every sample spent limiting,
+// and OUT+AUX measured ~4 points of the block over OUT. The reciprocal of sum_peak is now
+// carried from sample to sample and refined with two Newton steps (the same scheme as
+// plaits::Sp1Limiter in the vendored voice.h): sum_peak moves by at most 5 % of the gap
+// per sample, so the error is ~1e-6 -- and a real divide is taken at the onset of
+// limiting or after any jump the steps could not close. Same attack, release, ceiling.
+const float kQ15 = 1.0f / 32768.0f;          // int16 -> +-1
 const float kSumCeiling = 0.8f;
 float sum_peak = 0.0f;
+float sum_recip = 1.0f;
+bool sum_recip_valid = false;
 
-inline int32_t LimitedSum(const plaits::Voice::Frame& f) {
-  const float s = (static_cast<float>(f.out) + static_cast<float>(f.aux)) * kSumGain;
+inline float Limit(float s) {
   SLOPE(sum_peak, fabsf(s), 0.05f, 0.00002f);
-  const float g = sum_peak <= kSumCeiling ? 1.0f : kSumCeiling / sum_peak;
-  return Sat16(static_cast<int32_t>(s * g * 32768.0f));
+  if (sum_peak <= kSumCeiling) {
+    sum_recip_valid = false;
+    return s;
+  }
+  const float e = 1.0f - sum_peak * sum_recip;
+  if (!sum_recip_valid || e > 0.25f || e < -0.25f) {
+    sum_recip = 1.0f / sum_peak;
+    sum_recip_valid = true;
+  } else {
+    sum_recip = plaits::Sp1Limiter::Newton(sum_peak, sum_recip);
+  }
+  return s * kSumCeiling * sum_recip;
 }
 
-// ---- the soft-clip drive (M4b) ----
-// stmlib::SoftClip in int16 units, on OUT and AUX separately, upstream of both the ring
-// modulator and the OUT+AUX limiter. `g` is the linear gain; the caller guarantees
-// g > 1, because at g == 1 the stage is skipped rather than run (see sp1_synth.h).
+// ---- the drive's transfer curve, as a table (issue #22) ----
+// stmlib::SoftClip, tabulated: M4b evaluated it per sample (two range tests and a float
+// DIVIDE, 14 cycles on its own) on OUT and on AUX, and the log measured +8-10 % of the
+// block for it. A table read with linear interpolation is a few multiply-adds, and any
+// other memoryless curve would cost exactly the same -- which is what a future set of
+// drive shapes would plug into.
+//
+// SoftClip is odd and exactly +-1 beyond |x| = 3, so only 0..3 is stored. 512 segments:
+// linear interpolation's error is h^2/8 x max|f''|, about 2e-6 of full scale -- under a
+// tenth of one 16-bit step, so the table and the formula give the same int16 output to
+// within that rounding. constexpr, so the table is built by the compiler and lives in
+// flash; no generator script, and it cannot drift from the formula written here, which
+// is stmlib::SoftLimit's.
+constexpr int kShapeSegments = 512;
+constexpr float kShapeSpan = 3.0f;
+struct ShapeTable {
+  float v[kShapeSegments + 1];
+};
+constexpr ShapeTable MakeSoftClip() {
+  ShapeTable t{};
+  for (int i = 0; i <= kShapeSegments; ++i) {
+    const float x = kShapeSpan * static_cast<float>(i) / kShapeSegments;
+    t.v[i] = x * (27.0f + x * x) / (27.0f + 9.0f * x * x);
+  }
+  return t;
+}
+constexpr ShapeTable kSoftClip = MakeSoftClip();
+static_assert(kSoftClip.v[0] == 0.0f && kSoftClip.v[kShapeSegments] == 1.0f,
+              "SoftClip is 0 at 0 and exactly 1 at |x| = 3");
+
+inline float Shape(float x) {
+  const float a = fabsf(x) * (kShapeSegments / kShapeSpan);
+  float y = 1.0f;
+  if (a < static_cast<float>(kShapeSegments)) {
+    const int i = static_cast<int>(a);
+    const float fr = a - static_cast<float>(i);
+    y = kSoftClip.v[i] + (kSoftClip.v[i + 1] - kSoftClip.v[i]) * fr;
+  }
+  return x < 0.0f ? -y : y;
+}
+
+// ---- the soft-clip drive (M4b; one channel since issue #22) ----
+// ONE drive, after the output select and before the OUT+AUX limiter (Adara): OUT, AUX,
+// OUT+AUX or OUTxAUX is chosen first and the result is driven, so the sum and the ring
+// product distort as one signal -- the intermodulation is the point. The limiter stays
+// LAST because it bounds what leaves the device. The stage is applied only while the
+// gain is above 1: at g == 1 it is skipped rather than run (see sp1_synth.h).
 volatile int drive_step;                     // main writes, audio reads per block
 float drive_gain_prev = 1.0f;                // audio thread: last block's gain
 
@@ -164,24 +225,125 @@ inline float DriveGain(int step) {
   return powf(10.0f, static_cast<float>(kDriveDb[step]) / 20.0f);
 }
 
-inline int16_t Drive1(int16_t v, float g) {
-  const float x = static_cast<float>(v) * (1.0f / 32768.0f) * g;
-  return Sat16(static_cast<int32_t>(stmlib::SoftClip(x) * 32768.0f));
+// ---- what the voice mixes before its one gate (issue #22) ----
+// The output select is a set of weights the voice applies BEFORE its low-pass gate
+// (see the vendored plaits/dsp/voice.h): OUT, AUX, their sum at -3 dB (as M3f's OUT+AUX),
+// or their product x 2 (as M3f's OUTxAUX). A mode change is a cross-fade of the weights
+// across one DMA block, so it never clicks.
+plaits::Voice::OutputMix MixFor(int mode) {
+  switch (mode) {
+    case SP1_OUT_AUX:  return { 0.0f, 1.0f, 0.0f };
+    case SP1_OUT_SUM:  return { 0.7071f, 0.7071f, 0.0f };
+    case SP1_OUT_RING: return { 0.0f, 0.0f, 1.0f };
+    default:           return { 1.0f, 0.0f, 0.0f };
+  }
 }
 
-// One output sample for an output mode (sp1_synth.h), already saturated to 16 bits.
-// `sum` is LimitedSum() of this frame, computed by the caller when needed.
-inline int32_t Mix(int mode, const plaits::Voice::Frame& f, int32_t sum) {
-  switch (mode) {
-    case SP1_OUT_AUX:
-      return f.aux;
-    case SP1_OUT_SUM:
-      return sum;
-    case SP1_OUT_RING:   // (a x b) / 32768 x 2 = (a x b) >> 14
-      return Sat16((static_cast<int32_t>(f.out) * f.aux) >> 14);
-    default:
-      return f.out;
+plaits::Voice::OutputMix MixLerp(const plaits::Voice::OutputMix& a,
+                                 const plaits::Voice::OutputMix& b, float t) {
+  return { a.out + (b.out - a.out) * t, a.aux + (b.aux - a.aux) * t,
+           a.ring + (b.ring - a.ring) * t };
+}
+
+// One output sample after the gate: the drive, then the OUT+AUX limiter (Adara: the
+// limiter stays LAST, it bounds what leaves the device), saturated to 16 bits. `in` is
+// the voice's unclipped output in 16-bit scale (see the vendored voice.h); with both
+// stages off it is converted exactly as Plaits' own output stage did.
+template <bool kLimit, bool kDrive>
+inline int16_t Stage(float in, float g) {
+  if (!kLimit && !kDrive) {
+    return Sat16(1 + static_cast<int32_t>(in));
   }
+  float v = in * kQ15;
+  if (kDrive) {
+    v = Shape(v * g);
+  }
+  if (kLimit) {
+    v = Limit(v);
+  }
+  return Sat16(static_cast<int32_t>(v * 32768.0f));
+}
+
+// The same with the drive state known only at run time: the one block in which the
+// drive gain ramps.
+inline int16_t StageAny(bool limit, bool drive, float in, float g) {
+  if (limit) {
+    return drive ? Stage<true, true>(in, g) : Stage<true, false>(in, g);
+  }
+  return drive ? Stage<false, true>(in, g) : Stage<false, false>(in, g);
+}
+
+// A whole Plaits block in a steady state -- no drive ramp -- which is every block but
+// one per change. Both switches are template arguments, so the per-sample loop carries
+// no branch on either.
+template <bool kLimit, bool kDrive>
+void StageBlock(const float* in, int16_t* out, float g) {
+  for (size_t i = 0; i < plaits::kBlockSize; ++i) {
+    out[i] = Stage<kLimit, kDrive>(in[i], g);
+  }
+}
+
+inline void StageBlockAny(bool limit, bool drive, const float* in, int16_t* out,
+                          float g) {
+  if (limit) {
+    drive ? StageBlock<true, true>(in, out, g) : StageBlock<true, false>(in, out, g);
+  } else {
+    drive ? StageBlock<false, true>(in, out, g) : StageBlock<false, false>(in, out, g);
+  }
+}
+
+// ---- Marbles -> Plaits routing, resolved once per DMA block (issue #22) ----
+// The routing depends only on where each output is sent, which cannot change inside a
+// DMA block, so the "which destination, what scale, is it patched" decisions are taken
+// once per DMA block into a short list, and each Plaits block just walks the list. The
+// list keeps the old summation order (t1..t3, then X1..X3, Y) and the same products, so
+// the sums are bit-identical to the per-block switches this replaces; the cost grows
+// with the number of routed outputs (a patch setting), never with modulation.
+enum RouteDest { kRouteNote, kRouteFm, kRouteTimbre, kRouteMorph, kRouteHarm,
+                 kRouteLevel, kRouteCount };
+
+struct Route {
+  uint8_t source;       // 0..2 = t1..t3 (a gate, 0 or +5 V), 3..6 = X1..X3, Y
+  uint8_t dest;         // RouteDest
+  float scale;          // per volt, as Plaits' own CV calibration (see kVoltPerOct)
+};
+
+struct Routing {
+  Route route[7];
+  int count;
+  bool fm_patched, timbre_patched, morph_patched, harm_patched, level_routed;
+};
+
+void AddRoute(Routing* r, int source, int dest) {
+  float scale;
+  RouteDest d;
+  switch (dest) {
+    case SP1_DEST_VOCT:   d = kRouteNote;   scale = kVoltPerOct; break;
+    case SP1_DEST_FM:     d = kRouteFm;     scale = kVoltPerOct; r->fm_patched = true; break;
+    case SP1_DEST_TIMBRE: d = kRouteTimbre; scale = kTimbrePerVolt; r->timbre_patched = true; break;
+    case SP1_DEST_MORPH:  d = kRouteMorph;  scale = kTimbrePerVolt; r->morph_patched = true; break;
+    case SP1_DEST_HARM:   d = kRouteHarm;   scale = kHarmPerVolt; r->harm_patched = true; break;
+    case SP1_DEST_LEVEL:  d = kRouteLevel;  scale = 0.2f; r->level_routed = true; break;
+    default: return;      // none, and TRIG (handled by the gate mask)
+  }
+  r->route[r->count].source = static_cast<uint8_t>(source);
+  r->route[r->count].dest = static_cast<uint8_t>(d);
+  r->route[r->count].scale = scale;
+  ++r->count;
+}
+
+Routing ResolveRouting(const sp1_synth_params& c) {
+  Routing r = {};
+  for (int t = 0; t < 3; ++t) {
+    // A t output is a gate: V/Oct is not one of its destinations (as before).
+    if (c.mrb_t_dest[t] != SP1_DEST_VOCT) {
+      AddRoute(&r, t, c.mrb_t_dest[t]);
+    }
+  }
+  for (int k = 0; k < 4; ++k) {
+    AddRoute(&r, 3 + k, c.mrb_dest[k]);
+  }
+  return r;
 }
 
 }  // namespace
@@ -252,7 +414,19 @@ extern "C" void sp1_synth_init(void) {
   trig_blocks_left = 0;
 }
 
+// ---- where the block went (issue #22; sp1_synth.h) ----
+const volatile uint32_t* cyc_counter;        // NULL = no profile (host, or not set yet)
+sp1_synth_profile prof;                      // audio thread: spans of the last render
+
+inline uint32_t Now() {
+  return cyc_counter ? *cyc_counter : 0u;
+}
+
 extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
+  const uint32_t prof_t0 = Now();
+  uint32_t prof_eng = 0u;
+  uint32_t prof_post = 0u;
+  prof.total = prof.mrb = prof.eng = prof.post = 0u;
   if (!voice) {
     for (uint32_t i = 0; i < frames; ++i) {
       out[i] = 0;
@@ -301,10 +475,18 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
   // Marbles, one sample per Plaits block (the 4 kHz rule, sp1_marbles.h). Stopped,
   // it renders nothing and every Marbles input below stays unpatched.
   const bool mrb = sp1_marbles_running();
+  const uint32_t prof_m0 = Now();
   sp1_marbles_render(frames / plaits::kBlockSize);
+  prof.mrb = Now() - prof_m0;
   if (!mrb) {
     mrb_gates_prev = 0u;
   }
+  // This block's routing and Marbles' frames (issue #22: see ResolveRouting).
+  const Routing routing = ResolveRouting(c);
+  const uint8_t* const mrb_gates = sp1_marbles_gate_frames();
+  const float* const mrb_volts = sp1_marbles_volt_frames();
+  const float* const mrb_ramp = sp1_marbles_ramp_frames();
+
 
   // ---- the burst (M4e): phase-locked to Marbles' master ramp while it runs ----
   // Stopped there is nothing to lock to, so the free-running accumulator stands: fire at
@@ -317,11 +499,15 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
   burst_on = breq;
   const int32_t sp32 = static_cast<int32_t>(samples_per_32nd);
   const int omode = output_mode;
-  const int32_t fade_len = static_cast<int32_t>(frames);
-  int32_t fade_left = 0;
-  if (omode != output_prev) {
-    fade_left = fade_len;              // output_prev is the mode being left
-  }
+  // Output select (issue #22: weights into the voice's one gate). A change cross-fades
+  // from the mode being left (output_prev) across this whole DMA block.
+  const plaits::Voice::OutputMix mix_now = MixFor(omode);
+  const plaits::Voice::OutputMix mix_was = MixFor(output_prev);
+  const bool fading = omode != output_prev;
+  const float fade_step = static_cast<float>(plaits::kBlockSize) /
+                          static_cast<float>(frames ? frames : plaits::kBlockSize);
+  // The OUT+AUX limiter runs while OUT+AUX is selected or being faded to or from.
+  const bool limiting = omode == SP1_OUT_SUM || output_prev == SP1_OUT_SUM;
 
   // Drive: one linear ramp across the DMA block, so a step never clicks. Both ends at
   // exactly 1.0 means the stage is off for the whole block and is skipped.
@@ -333,13 +519,13 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
   float drive_g = drive_from;
   drive_gain_prev = drive_target;
 
-  plaits::Voice::Frame f[plaits::kBlockSize];
+  float v[plaits::kBlockSize];
   uint32_t j = 0;                      // Plaits block index = Marbles frame index
   while (frames >= plaits::kBlockSize) {
     bool new_edge = pulse_started && j == 0;
     if (burst_on && mrb) {
       // ---- running: the grid IS Marbles' clock ----
-      const float ramp = sp1_marbles_ramp(j);
+      const float ramp = mrb_ramp[j];
       if (!burst_locked) {
         // First frame of this hold. Quantise to the NEAREST grid point rather than
         // firing on the press: if we are in the first half of the current grid cell,
@@ -386,8 +572,16 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
     }
 
     // ---- Marbles -> Plaits, only while the clock runs (Adara, M4) ----
-    float m_note = 0.0f, m_fm = 0.0f, m_timbre = 0.0f, m_morph = 0.0f, m_harm = 0.0f;
-    float m_level = 0.0f;
+    // Destinations sum, scaled as Plaits scales its own CV inputs (plaits/settings.cc,
+    // default calibration, per 5 V): V/Oct and FM 60 semitones (12 per volt; FM then x
+    // the FM attenuverter), TIMBRE and MORPH 1.6, HARMONICS 1.0 (x their attenuverters).
+    // A t output counts as its gate, 0 or +5 V (M4a).
+    //
+    // ⚠️ A destination counts as PATCHED whether its gate is high or low. A low gate
+    // contributes 0 V, not "nothing": if the patched flag followed the gate, Plaits would
+    // hand the parameter back to its internal envelope between gates and the
+    // attenuverter would flip meaning several times a second.
+    float m[kRouteCount] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
     bool fm_patched = false, timbre_patched = false, morph_patched = false;
     bool harm_patched = false, level_routed = false;
     if (mrb) {
@@ -395,62 +589,34 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
       // rising edge among them counts even if another routed gate is already high.
       // Edges are taken from the RAW gates, then masked: routing a t output on
       // while its gate is already high is not an edge (no stray TRIG).
-      const uint8_t raw = sp1_marbles_gates(j);
+      const uint8_t raw = mrb_gates[j];
       if (raw & static_cast<uint8_t>(~mrb_gates_prev) & trig_mask) {
         new_edge = true;
       }
       mrb_gates_prev = raw;
       level = level || (raw & trig_mask) != 0u;
-      // t1..t3 on any other destination: the gate as 0 / +5 V, scaled exactly like an
-      // X voltage (M4a). Every destination's sum is clamped below.
-      //
-      // ⚠️ The destination counts as PATCHED whether the gate is high or low. A low
-      // gate contributes 0 V, not "nothing": if the patched flag followed the gate,
-      // Plaits would hand the parameter back to its internal envelope between gates
-      // and the attenuverter would flip meaning several times a second.
-      for (int t = 0; t < 3; ++t) {
-        const float g = (raw & static_cast<uint8_t>(1u << t)) ? kGateVolts : 0.0f;
-        switch (c.mrb_t_dest[t]) {
-          case SP1_DEST_FM:
-            m_fm += kVoltPerOct * g; fm_patched = true; break;
-          case SP1_DEST_TIMBRE:
-            m_timbre += kTimbrePerVolt * g; timbre_patched = true; break;
-          case SP1_DEST_MORPH:
-            m_morph += kTimbrePerVolt * g; morph_patched = true; break;
-          case SP1_DEST_HARM:
-            m_harm += kHarmPerVolt * g; harm_patched = true; break;
-          case SP1_DEST_LEVEL:
-            m_level += g * 0.2f; level_routed = true; break;
-          default: break;              // TRIG is handled by the mask above
-        }
+
+      const float* const volts = &mrb_volts[4u * j];
+      for (int i = 0; i < routing.count; ++i) {
+        const Route& r = routing.route[i];
+        const float value = r.source < 3u
+            ? ((raw >> r.source) & 1u ? kGateVolts : 0.0f)
+            : volts[r.source - 3u];
+        m[r.dest] += r.scale * value;
       }
-      // X1..X3, Y: summed per destination, scaled as Plaits scales its own CV
-      // inputs (plaits/settings.cc, default calibration, per 5 V): V/Oct and FM
-      // 60 semitones (12 per volt; FM then x the FM attenuverter), TIMBRE and
-      // MORPH 1.6, HARMONICS 1.0 (x their attenuverters).
-      for (int k = 0; k < 4; ++k) {
-        const float v = sp1_marbles_volts(j, k);
-        switch (c.mrb_dest[k]) {
-          case SP1_DEST_VOCT:   m_note += kVoltPerOct * v; break;
-          case SP1_DEST_FM:     m_fm += kVoltPerOct * v; fm_patched = true; break;
-          case SP1_DEST_TIMBRE:
-            m_timbre += kTimbrePerVolt * v; timbre_patched = true; break;
-          case SP1_DEST_MORPH:
-            m_morph += kTimbrePerVolt * v; morph_patched = true; break;
-          case SP1_DEST_HARM:
-            m_harm += kHarmPerVolt * v; harm_patched = true; break;
-          case SP1_DEST_LEVEL:  m_level += v * 0.2f; level_routed = true; break;
-          default: break;
-        }
-      }
-      // One output's worth, whatever is stacked on it.
-      m_note = Clamp(m_note, -kMaxSemis, kMaxSemis);
-      m_fm = Clamp(m_fm, -kMaxSemis, kMaxSemis);
-      m_timbre = Clamp(m_timbre, -kMaxTimbre, kMaxTimbre);
-      m_morph = Clamp(m_morph, -kMaxTimbre, kMaxTimbre);
-      m_harm = Clamp(m_harm, -kMaxHarm, kMaxHarm);
-      m_level = Clamp(m_level, 0.0f, 1.0f);
+      fm_patched = routing.fm_patched;
+      timbre_patched = routing.timbre_patched;
+      morph_patched = routing.morph_patched;
+      harm_patched = routing.harm_patched;
+      level_routed = routing.level_routed;
     }
+    // One output's worth, whatever is stacked on it (M4a).
+    const float m_note = Clamp(m[kRouteNote], -kMaxSemis, kMaxSemis);
+    const float m_fm = Clamp(m[kRouteFm], -kMaxSemis, kMaxSemis);
+    const float m_timbre = Clamp(m[kRouteTimbre], -kMaxTimbre, kMaxTimbre);
+    const float m_morph = Clamp(m[kRouteMorph], -kMaxTimbre, kMaxTimbre);
+    const float m_harm = Clamp(m[kRouteHarm], -kMaxHarm, kMaxHarm);
+    const float m_level = Clamp(m[kRouteLevel], 0.0f, 1.0f);
     // A new edge while TRIG is already high: one low block, so Plaits sees it.
     if (new_edge && trig_level_prev) {
       level = false;
@@ -492,33 +658,40 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
       patch.note = c.note;
     }
     ++j;
-    voice->Render(patch, mods, f, plaits::kBlockSize);
-    for (size_t i = 0; i < plaits::kBlockSize; ++i) {
-      if (driving) {
+    const uint32_t prof_e0 = Now();
+    if (fading) {
+      const float t0 = static_cast<float>(j - 1u) * fade_step;
+      voice->Render(patch, mods, MixLerp(mix_was, mix_now, t0),
+                    MixLerp(mix_was, mix_now, t0 + fade_step), v, plaits::kBlockSize);
+    } else {
+      voice->Render(patch, mods, mix_now, mix_now, v, plaits::kBlockSize);
+    }
+    const uint32_t prof_e1 = Now();
+    prof_eng += prof_e1 - prof_e0;
+    if (drive_inc == 0.0f) {
+      StageBlockAny(limiting, driving, v, out, drive_g);
+    } else {
+      for (size_t i = 0; i < plaits::kBlockSize; ++i) {
         drive_g += drive_inc;
-        if (drive_g > 1.0f) {
-          f[i].out = Drive1(f[i].out, drive_g);
-          f[i].aux = Drive1(f[i].aux, drive_g);
-        }
-      }
-      const bool need_sum = omode == SP1_OUT_SUM ||
-                            (fade_left > 0 && output_prev == SP1_OUT_SUM);
-      const int32_t sum = need_sum ? LimitedSum(f[i]) : 0;
-      const int32_t now = Mix(omode, f[i], sum);
-      if (fade_left > 0) {
-        // Changing the output mode cross-fades over one DMA block, so the switch
-        // never clicks.
-        const int32_t was = Mix(output_prev, f[i], sum);
-        out[i] = Sat16((was * fade_left + now * (fade_len - fade_left)) / fade_len);
-        --fade_left;
-      } else {
-        out[i] = static_cast<int16_t>(now);
+        out[i] = StageAny(limiting, drive_g > 1.0f, v[i], drive_g);
       }
     }
+    prof_post += Now() - prof_e1;
     out += plaits::kBlockSize;
     frames -= plaits::kBlockSize;
   }
   output_prev = omode;
+  prof.eng = prof_eng;
+  prof.post = prof_post;
+  prof.total = Now() - prof_t0;
+}
+
+extern "C" void sp1_synth_set_cycle_counter(const volatile uint32_t* counter) {
+  cyc_counter = counter;
+}
+
+extern "C" void sp1_synth_last_profile(sp1_synth_profile* out) {
+  *out = prof;
 }
 
 extern "C" void sp1_synth_set_params(const sp1_synth_params* p) {
@@ -607,3 +780,13 @@ static_assert(plaits::Patch::kSp1HarmonicsAttenuverter,
 static_assert(plaits::Ensemble::kSp1Override, "Ensemble replacement not applied");
 static_assert(plaits::StringSynthOscillator::kSp1Override,
               "String-synth oscillator replacement not applied");
+static_assert(plaits::Voice::kSp1SingleLpg,
+              "voice.h replacement not applied: two low-pass gates");
+static_assert(plaits::VariableShapeOscillator::kSp1Override &&
+                  plaits::VariableSawOscillator::kSp1Override,
+              "oscillator replacements not applied: two divides per sample");
+static_assert(plaits::ChordEngine::kSp1SharedWaveform &&
+                  plaits::WavetableOscillator<128, 15>::kSp1Override,
+              "chord engine replacement not applied: per-voice waveform");
+static_assert(plaits::ChordEngine::kSp1BoundedCrossfade,
+              "chord_engine.h override not applied: Chords' crossfade is unbounded");
