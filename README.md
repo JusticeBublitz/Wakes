@@ -18,11 +18,11 @@ IMPORTANT: Flashing custom firmware on the SP-1 is at your own risk. SP-1s are a
 
 ## Status
 
-**v0.4.8, pre-release for beta testing.** Report problems with the bug form under [Issues](https://github.com/Worldwave/Wakes/issues).
+**v0.5.0, pre-release for beta testing.** Report problems with the bug form under [Issues](https://github.com/Worldwave/Wakes/issues).
 
 ## Flashing
 
-1. Download `wakes-sp1-v0.4.8.bin` from the
+1. Download `wakes-sp1-v0.5.0.bin` from the
    [latest release](https://github.com/Worldwave/Wakes/releases).
 2. Open <https://solderless.engineering>. Hold down **T1+T4** while connecting the SP-1 over USB-C.
 4. Select the `.bin` in Solderless Engineering's page, flash it, and once done, you can unplug.
@@ -57,13 +57,17 @@ Output: `build/zephyr/wakes-sp1.bin`. The Zephyr patch is required and is lost o
 | [`docs/PLAITS-ENGINES.md`](docs/PLAITS-ENGINES.md) | every engine, its faders and its CPU cost |
 | [`docs/MARBLES-SETTINGS.md`](docs/MARBLES-SETTINGS.md) | Marbles models, ranges and scales |
 | [`docs/DEFAULTS.md`](docs/DEFAULTS.md) | every default, and what a reset restores |
+| [`docs/MIDI.md`](docs/MIDI.md) | MIDI over USB: what it does, and how to change it |
+| [`config/midi.ini`](config/midi.ini) | the MIDI script: channel, legato, CC numbers (editable) |
 | [`docs/SAFETY.md`](docs/SAFETY.md) | rules for anyone changing the firmware |
 
 ## Licence
 
-MIT, Copyright (c) 2026 Worldwave | Adara Barami. See [`LICENSE`](LICENSE).
+MIT, Copyright (c) 2026 Worldwave | Adara Barami. See [`LICENSE`](LICENSE). A few files are
+Apache-2.0 instead, because they derive from Zephyr (Apache-2.0); [`NOTICE`](NOTICE) lists them.
 
 Plaits, Marbles and stmlib are by Émilie Gillet (MIT), included unmodified in
-`third_party/eurorack/`. The board support builds on chattock/sp1-tape-looper,
-timknapen/SP-1-dev and ericlewis/sp1-midi (all MIT). Details in [`NOTICE`](NOTICE) and
-[`LICENSES/`](LICENSES/).
+`third_party/eurorack/`; the MIDI note handling is ported from her Yarns. The USB-MIDI class
+is feldd's (bnjreece/feldd-sp1-firmware, MIT), included unmodified in `third_party/feldd/`.
+The board support builds on chattock/sp1-tape-looper, timknapen/SP-1-dev and
+ericlewis/sp1-midi (all MIT). Details in [`NOTICE`](NOTICE) and [`LICENSES/`](LICENSES/).

@@ -85,25 +85,27 @@ The failure modes that recur on this board:
 
 The last two are the expensive ones, because they build cleanly and fail on hardware.
 
-### USB console fallback
+### The USB device
 
-`firmware/CMakeLists.txt` includes
-`${ZEPHYR_BASE}/samples/subsys/usb/common/common.cmake` and `sp1_console.c` includes
-`<sample_usbd.h>` to use `sample_usbd_init_device()`. This is the path
-sp1-tape-looper proved on this board and this Zephyr version, but it is a dependency on
-Zephyr's **samples** tree, which moves between releases.
+Since M5a the USB device is built directly in `firmware/src/sp1_usbd.c` with
+`USBD_DEVICE_DEFINE` / `USBD_CONFIGURATION_DEFINE` / `USBD_DESC_*_DEFINE` -- the fallback this
+section used to describe. Through M4e the console came up through Zephyr's sample helper
+(`samples/subsys/usb/common/`), which was a dependency on Zephyr's **samples** tree and
+hard-codes Zephyr's test vendor ID. The device's identity is now `CONFIG_SP1_USB_VID`,
+`_PID`, `_MANUFACTURER`, `_PRODUCT` and `_MAX_POWER` in `firmware/Kconfig`.
 
-If it does not resolve:
+Functions on the device: the CDC ACM console, and (with `CONFIG_SP1_MIDI`, the default) feldd's
+USB-MIDI 1.0 class from `third_party/feldd/`, patched at build time by `tools/apply_patch.py`.
+⚠️ Change `CONFIG_SP1_USB_PID` whenever that list changes: hosts cache descriptors by
+VID/PID. `tools/console-log.py` matches the console on the PID and knows both values used so
+far.
 
-- `CONFIG_SAMPLE_USBD_VID` undefined → sp1-tape-looper hit this on v4.3.x and shimmed it
-  in `boards/.../Kconfig.stem_player` with a `default 0x2fe3`. Harmless; the device
-  enumerates under Zephyr's VID instead of ours.
-- `sample_usbd.h` not found → check the `common.cmake` path exists in your Zephyr
-  checkout; the directory has moved before.
-- Whole helper unavailable → build the USBD context directly with
-  `USBD_DEVICE_DEFINE` / `USBD_CONFIGURATION_DEFINE` / `USBD_DESC_*_DEFINE` in
-  `sp1_console.c`, which removes the samples dependency entirely. More boilerplate, no
-  behaviour change.
+**The stored log** (`firmware/src/sp1_logbuf.h`): everything printk writes is also kept in RAM
+(`CONFIG_SP1_LOGBUF_KB`, 96 KB, ~14 minutes), because a session with the port in another host's
+hands (the OP-XY) has nobody reading the console. When a terminal next opens it, the device plays
+the stored log back after the banner, each line stamped with its uptime, then goes on live. Keep
+Wakes ON, move the cable to the PC, start the logger. It lives in `.noinit`, so it carries on
+across a soft reset if the bootloader leaves RAM alone (unverified).
 
 **Do not fall back to `CONFIG_USB_DEVICE_STACK` (legacy).** It is smaller, but deprecated,
 and mass storage later needs device_next anyway — we would only migrate twice.

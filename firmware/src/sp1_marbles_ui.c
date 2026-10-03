@@ -7,6 +7,7 @@
 #include "sp1_marbles_ui.h"
 
 #include "sp1_ui_timing.h"
+#include "sp1_midi.h"         /* MIDI CC offsets (M5a) */
 
 #include <math.h>
 #include <stddef.h>
@@ -131,6 +132,20 @@ static enum sp1_mui_layer canon(enum sp1_mui_layer l, int i)
 }
 #define VAL(l, i) (stored[canon((l), (i))][(i)])
 #define CAT(l, i) (catching[canon((l), (i))][(i)])
+
+/* The MIDI destination behind each fader slot, for pickup shared / takeover (sp1_midi.h):
+ * there the CC moves the stored value itself, as a second hand on the fader. Indexed by the
+ * CANONICAL slot, so the X pages' F4 (-1 here) are the t pages' DEJA VU and LENGTH. */
+static const int8_t midi_dest[SP1_MUI_LAYERS][4] = {
+	[SP1_MUI_T_BASE]  = { SP1_MIDI_D_RATE, SP1_MIDI_D_T_BIAS, SP1_MIDI_D_JITTER,
+			      SP1_MIDI_D_DEJA_VU },
+	[SP1_MUI_T_SHIFT] = { -1, SP1_MIDI_D_GATE_LENGTH, SP1_MIDI_D_GATE_LENGTH_RANDOM,
+			      SP1_MIDI_D_LENGTH },
+	[SP1_MUI_X_BASE]  = { SP1_MIDI_D_SPREAD, SP1_MIDI_D_X_BIAS, SP1_MIDI_D_STEPS, -1 },
+	[SP1_MUI_X_SHIFT] = { -1, -1, -1, -1 },
+	[SP1_MUI_Y]       = { SP1_MIDI_D_Y_SPREAD, SP1_MIDI_D_Y_BIAS, SP1_MIDI_D_Y_STEPS,
+			      SP1_MIDI_D_Y_DIVIDER },
+};
 
 /* The order a tap cycles the destinations, per side. BOTH rings start at NONE (Adara's
  * correction to docs/UI-PAGES.md, M4b), so the two sides read the same way round and
@@ -382,7 +397,12 @@ uint32_t sp1_mui_tick(uint32_t elapsed_ms, const uint16_t raw[4], bool valid,
 	if (valid) {
 		for (int i = 0; i < 4; i++) {
 			float *const s = &VAL(active, i);
-			if (!CAT(active, i)) {
+			if (sp1_midi_fader_held(midi_dest[canon(active, i)][i])) {
+				/* Pickup takeover, MIDI plugged in: the CC has it, the fader
+				 * rests, and catches up after the port goes (sp1_plaits_ui.c). */
+				prev[i] = pos[i];
+				CAT(active, i) = fabsf(*s - pos[i]) >= CATCH_MATCH;
+			} else if (!CAT(active, i)) {
 				*s = pos[i];
 				prev[i] = pos[i];
 			} else {
@@ -414,6 +434,21 @@ uint32_t sp1_mui_tick(uint32_t elapsed_ms, const uint16_t raw[4], bool valid,
 	show_ms = show_ms > elapsed_ms ? show_ms - elapsed_ms : 0u;
 	breath_ms = (breath_ms + elapsed_ms) % BREATH_MS;
 	return ev;
+}
+
+void sp1_mui_midi(void)
+{
+	/* Every layer, as on PLAITS (sp1_pui_midi). A value MIDI moved under the active layer's
+	 * fader re-checks that fader's pickup; the others re-check when activated. */
+	for (int l = 0; l < SP1_MUI_LAYERS; l++) {
+		for (int i = 0; i < 4; i++) {
+			float *const s = &stored[l][i];
+			if (sp1_midi_drive(midi_dest[l][i], s) &&
+			    canon(active, i) == (enum sp1_mui_layer)l) {
+				catching[l][i] = fabsf(*s - pos[i]) >= CATCH_MATCH;
+			}
+		}
+	}
 }
 
 /* ---- buttons ---------------------------------------------------------------------- */
@@ -574,6 +609,26 @@ bool sp1_mui_scale_step(int dir)
 	}
 }
 
+/* ---- MIDI CCs (M5a) ----
+ * A CC is a second hand on its fader (sp1_midi.h): an offset in fader-travel units, added
+ * to the value the fader gives -- after the centre detent, so a CC near centre is not
+ * flattened by it -- and clamped as the fader would be. Stepped parameters take it on the
+ * fader position before it is cut into steps. Smoothed by the control loop: Marbles reads
+ * its parameters once per audio block, so smoothing any faster would buy nothing.
+ * That is pickup SUM. In shared / takeover the CC moves the stored value itself
+ * (sp1_mui_midi) and this is zero, apart from a [bind] source. */
+static float mo(int dest)
+{
+	return sp1_midi_offset(dest);
+}
+
+/* RATE in semitones: the fader spans 120 (Marbles' +-5 octaves), and so does a CC. */
+static float rate_of(float pos)
+{
+	const float r = (clamp01(pos) - 0.5f) * 120.0f + mo(SP1_MIDI_D_RATE) * 120.0f;
+	return r < -60.0f ? -60.0f : (r > 60.0f ? 60.0f : r);
+}
+
 /* ---- outputs ---------------------------------------------------------------------- */
 void sp1_mui_params(struct sp1_marbles_params *p)
 {
@@ -583,22 +638,25 @@ void sp1_mui_params(struct sp1_marbles_params *p)
 	const float *y  = stored[SP1_MUI_Y];
 	/* X SHIFT holds only LENGTH now, and LENGTH is mirrored into the t SHIFT layer. */
 
-	p->rate = (clamp01(tb[0]) - 0.5f) * 120.0f;   /* Marbles: 120 BPM at centre, +-5 oct */
+	p->rate = rate_of(tb[0]);                     /* Marbles: 120 BPM at centre, +-5 oct */
 	p->t_range = t_range;
 	p->t_model = model;
-	p->t_bias = detent(tb[1], DETENT_BIPOLAR);
-	p->t_jitter = clamp01(tb[2]);
+	p->t_bias = clamp01(detent(tb[1], DETENT_BIPOLAR) + mo(SP1_MIDI_D_T_BIAS));
+	p->t_jitter = clamp01(tb[2] + mo(SP1_MIDI_D_JITTER));
 	/* ONE knob (t BASE F4, shared with the X page), gated by [F] and [G]. Off means
 	 * that side ignores it and runs free, which is Marbles' own behaviour. */
-	const float deja_vu = detent(tb[3], DETENT_BIPOLAR);   /* centre = locked loop */
+	const float deja_vu = clamp01(detent(tb[3], DETENT_BIPOLAR) +   /* centre = locked */
+				      mo(SP1_MIDI_D_DEJA_VU));
 	p->t_deja_vu = dv_t ? deja_vu : 0.0f;
-	p->gate_length = clamp01(ts[1]);
-	p->gate_length_rand = clamp01(ts[2]);
-	p->length = loop_length[zone(ts[3], LOOP_STEPS, 0.25f, &q_length)];
+	p->gate_length = clamp01(ts[1] + mo(SP1_MIDI_D_GATE_LENGTH));
+	p->gate_length_rand = clamp01(ts[2] + mo(SP1_MIDI_D_GATE_LENGTH_RANDOM));
+	p->length = loop_length[zone(ts[3] + mo(SP1_MIDI_D_LENGTH), LOOP_STEPS, 0.25f,
+				     &q_length)];
 
-	p->x_spread = clamp01(xb[0]);
-	p->x_bias = detent(xb[1], DETENT_BIPOLAR);
-	p->x_steps = detent(xb[2], DETENT_BIPOLAR);    /* centre = raw, unquantized */
+	p->x_spread = clamp01(xb[0] + mo(SP1_MIDI_D_SPREAD));
+	p->x_bias = clamp01(detent(xb[1], DETENT_BIPOLAR) + mo(SP1_MIDI_D_X_BIAS));
+	p->x_steps = clamp01(detent(xb[2], DETENT_BIPOLAR) +           /* centre = raw */
+			     mo(SP1_MIDI_D_STEPS));
 	p->x_deja_vu = dv_x ? deja_vu : 0.0f;
 	p->x_diversity = diversity;
 	p->x_range = range;
@@ -613,10 +671,10 @@ void sp1_mui_params(struct sp1_marbles_params *p)
 	 * to change it (Adara, M4a: X SHIFT F2 unbound, X's clock source left alone). */
 	p->x_clock = SP1_MRB_XCLK_EACH;
 
-	p->y_spread = clamp01(y[0]);
-	p->y_bias = detent(y[1], DETENT_BIPOLAR);
-	p->y_steps = detent(y[2], DETENT_BIPOLAR);
-	p->y_divider = zone(y[3], 12, 0.1f, &q_ydiv);
+	p->y_spread = clamp01(y[0] + mo(SP1_MIDI_D_Y_SPREAD));
+	p->y_bias = clamp01(detent(y[1], DETENT_BIPOLAR) + mo(SP1_MIDI_D_Y_BIAS));
+	p->y_steps = clamp01(detent(y[2], DETENT_BIPOLAR) + mo(SP1_MIDI_D_Y_STEPS));
+	p->y_divider = zone(y[3] + mo(SP1_MIDI_D_Y_DIVIDER), 12, 0.1f, &q_ydiv);
 	p->y_range = range;   /* one [J] (M4e) */
 }
 
@@ -627,7 +685,7 @@ void sp1_mui_routing(struct sp1_mui_routing *out)
 
 float sp1_mui_bpm(void)
 {
-	return sp1_marbles_bpm((clamp01(stored[SP1_MUI_T_BASE][0]) - 0.5f) * 120.0f, t_range);
+	return sp1_marbles_bpm(rate_of(stored[SP1_MUI_T_BASE][0]), t_range);
 }
 
 static uint8_t volt_led(float v, int range)

@@ -25,6 +25,14 @@ If the port disappears -- unplugged, powered off, OR the device reset -- the log
 waits and reconnects rather than dying, and writes a marker line into the log. That
 makes a spontaneous device reset VISIBLE in the capture (marker, then a fresh
 banner) instead of appearing as the log simply ending. --no-reconnect disables it.
+
+Sessions this logger could not see -- the USB-C port in another host's hands (the OP-XY),
+or the device on battery -- are KEPT on the device (firmware/src/sp1_logbuf.h, the newest
+~14 minutes in RAM). Keep Wakes ON afterwards, plug it into this computer and start the
+logger: after the banner the device plays the stored log back between
+"=== STORED LOG ... ===" markers, each line stamped with the device's uptime
+("[+hh:mm:ss.mmm]") -- this logger's own timestamps on those lines are the time of the
+dump, not of the event. Then live output resumes. Turning Wakes off loses the stored log.
 """
 import argparse
 import datetime
@@ -37,10 +45,11 @@ try:
 except ImportError:
     sys.exit("pyserial is missing:  python -m pip install --user pyserial")
 
-# firmware/prj.conf sets CONFIG_SAMPLE_USBD_PID=0x5211. The VID is Zephyr's own
-# unless the SAMPLE_USBD_VID shim is in play, so match on PID and fall back to
-# any CDC device rather than being clever about it.
-WANT_PID = 0x5211
+# CONFIG_SP1_USB_PID in firmware/Kconfig: 0x5212 from M5a (console + MIDI), 0x5211 before
+# (console only) -- both, so the logger works with either firmware. The VID is Zephyr's
+# test VID until pid.codes grants one and may change, so match on PID.
+WANT_PIDS = (0x5212, 0x5211)
+PIDS_TEXT = " or ".join(f"{x:04x}" for x in WANT_PIDS)
 
 
 def describe(p):
@@ -50,7 +59,7 @@ def describe(p):
 
 
 def matches():
-    return [p for p in list_ports.comports() if p.pid == WANT_PID]
+    return [p for p in list_ports.comports() if p.pid in WANT_PIDS]
 
 
 def pick_port():
@@ -68,7 +77,7 @@ def pick_port():
         sys.exit(1)
 
     others = list(list_ports.comports())
-    print(f"No port with PID {WANT_PID:04x} (the SP-1 running M1c+).")
+    print(f"No port with PID {PIDS_TEXT} (the SP-1 running M1c+).")
     if others:
         print("\nPorts that ARE present:")
         for p in others:
@@ -101,7 +110,7 @@ def main():
             tag = "  <-- SP-1" if p in m else ""
             print(describe(p) + tag)
         if not m:
-            print(f"\n(nothing with PID {WANT_PID:04x} -- is M1c flashed?)")
+            print(f"\n(nothing with PID {PIDS_TEXT} -- is M1c flashed?)")
         return
 
     port = args.port or pick_port()

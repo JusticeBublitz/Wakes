@@ -6,6 +6,7 @@
 #include "sp1_plaits_ui.h"
 
 #include "sp1_marbles.h"      /* the scale quantizer FREQUENCY borrows (M4b) */
+#include "sp1_midi.h"         /* MIDI's offsets and the quantizer bypass (M5a) */
 #include "sp1_ui_timing.h"
 
 #include <math.h>
@@ -36,6 +37,11 @@
 #define CATCH_MATCH       0.005f   /* pot_controller.h: close enough to track       */
 #define DETENT_BIPOLAR    0.10f    /* Adara: 10 % of travel                          */
 #define DETENT_FREQ       0.05f    /* Adara: 5 % for FREQUENCY                       */
+/* ...and 10 % while MIDI is active (Adara, M5a test notes): with a keyboard playing through
+ * FREQUENCY, F1's centre IS the keyboard's tuning -- C4 = note 60 -- and 5 % of travel was too
+ * narrow to land on reliably. Only while MIDI is active, so the fader's feel without MIDI is
+ * unchanged. Outside the detent the travel is re-stretched, so the ends are still reached. */
+#define DETENT_FREQ_MIDI  0.10f
 #define LEVEL_OFF         0.05f    /* UI-SPEC: SETTINGS F4 below 5 % = disconnected  */
 #define TAP_MAX_MS        300u     /* a "••" press this short, untouched, is a tap   */
 #define DOUBLE_TAP_MS     400u     /* second tap must START within this of the 1st   */
@@ -73,10 +79,53 @@ static int      deg_q;                    /* ... and for its degree sweep (M4b) 
 static int      scale = SP1_PUI_SCALE_OFF;
 static bool     level_was;
 
+/* The MIDI destination behind each fader of each layer, for pickup shared / takeover
+ * (sp1_midi.h): there the CC moves the stored value itself, as a second hand on the fader. */
+static const int8_t midi_dest[SP1_PUI_LAYERS][4] = {
+	[SP1_PUI_BASE]     = { SP1_MIDI_D_FREQUENCY, SP1_MIDI_D_TIMBRE, SP1_MIDI_D_MORPH,
+			       SP1_MIDI_D_HARMONICS },
+	[SP1_PUI_SHIFT]    = { SP1_MIDI_D_FM_ATTENUVERTER, SP1_MIDI_D_TIMBRE_ATTENUVERTER,
+			       SP1_MIDI_D_MORPH_ATTENUVERTER, SP1_MIDI_D_HARMONICS_ATTENUVERTER },
+	[SP1_PUI_SETTINGS] = { SP1_MIDI_D_OCTAVE_RANGE, SP1_MIDI_D_LPG_COLOUR,
+			       SP1_MIDI_D_LPG_DECAY, SP1_MIDI_D_LEVEL },
+};
+
 /* ---- helpers ---------------------------------------------------------------- */
 static float clamp01(float x)
 {
 	return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+}
+
+/* ---- the engine that PLAYS (M5a) ----
+ * `slot` is what T2/T3 selected; MIDI's MODEL CC offsets it, through the filled slots of
+ * config/engines.csv in order, clamped at both ends (Plaits' own MODEL CV input is an offset
+ * from the button-selected model too). A CC at either end reaches every filled slot from
+ * any selection. Everything that depends on the engine actually sounding -- its detents,
+ * Plaits' engine index, INTELLIGENT's polarity, the log -- uses this; the engine flash and
+ * T2/T3 stepping keep using the selection. */
+static int eslot(void)
+{
+	const float off = sp1_midi_offset(SP1_MIDI_D_MODEL);
+	if (off == 0.0f) {
+		return slot;
+	}
+	int filled[SP1_ENGINE_SLOTS];
+	int n = 0, here = 0;
+	for (int i = 0; i < SP1_ENGINE_SLOTS; i++) {
+		if (SP1_ENGINE_TABLE[i].on) {
+			if (i == slot) {
+				here = n;
+			}
+			filled[n++] = i;
+		}
+	}
+	if (n <= 1) {
+		return slot;
+	}
+	const float step = off * (float)(n - 1);
+	int k = here + (int)(step < 0.0f ? step - 0.5f : step + 0.5f);
+	k = k < 0 ? 0 : (k > n - 1 ? n - 1 : k);
+	return filled[k];
 }
 
 static float to01(uint16_t raw)
@@ -109,7 +158,7 @@ static bool bipolar(enum sp1_pui_layer l, int i)
 	case SP1_PUI_SETTINGS:
 		return false;                            /* range, colour, decay, LEVEL      */
 	default: {
-		const uint8_t c = SP1_ENGINE_TABLE[slot].centre;
+		const uint8_t c = SP1_ENGINE_TABLE[eslot()].centre;
 		return (i == 1 && (c & C_T)) || (i == 2 && (c & C_M)) || (i == 3 && (c & C_H));
 	}
 	}
@@ -258,6 +307,14 @@ uint32_t sp1_pui_tick(uint32_t elapsed_ms, const uint16_t raw[4], bool valid,
 	if (valid) {
 		for (int i = 0; i < 4; i++) {
 			float *const s = &stored[active][i];
+			if (sp1_midi_fader_held(midi_dest[active][i])) {
+				/* Pickup takeover, MIDI plugged in: the CC has this parameter and
+				 * the fader rests. Kept as a reference, so after the port goes it
+				 * catches up from where it is rather than from where it was. */
+				prev[i] = pos[i];
+				catching[active][i] = fabsf(*s - pos[i]) >= CATCH_MATCH;
+				continue;
+			}
 			if (!catching[active][i]) {
 				*s = pos[i];
 				prev[i] = pos[i];
@@ -297,10 +354,29 @@ uint32_t sp1_pui_tick(uint32_t elapsed_ms, const uint16_t raw[4], bool valid,
 	return ev;
 }
 
+void sp1_pui_midi(void)
+{
+	/* Every layer, not just the one on show: a host can move a SETTINGS value while you
+	 * stand on BASE. A value MIDI moved on the active layer re-checks that fader's pickup,
+	 * so the fader catches up with it rather than snapping it back. Other layers re-check
+	 * when they are activated (activate()). */
+	for (int l = 0; l < SP1_PUI_LAYERS; l++) {
+		for (int i = 0; i < 4; i++) {
+			float *const s = &stored[l][i];
+			if (sp1_midi_drive(midi_dest[l][i], s) && l == (int)active) {
+				catching[l][i] = fabsf(*s - pos[i]) >= CATCH_MATCH;
+			}
+		}
+	}
+}
+
 int sp1_pui_octave_mode(void)
 {
-	/* SETTINGS F1 since M4a (it was F4). */
-	int o = (int)(stored[SP1_PUI_SETTINGS][0] * 11.0f);
+	/* SETTINGS F1 since M4a (it was F4). MIDI's OCTAVE range CC moves the fader position
+	 * before it is cut into the eleven modes (M5a), so it steps through whole modes. */
+	const float p = clamp01(stored[SP1_PUI_SETTINGS][0] +
+				sp1_midi_offset(SP1_MIDI_D_OCTAVE_RANGE));
+	int o = (int)(p * 11.0f);
 	return o < 0 ? 0 : (o > 10 ? 10 : o);
 }
 
@@ -309,7 +385,13 @@ void sp1_pui_params(struct sp1_synth_params *p)
 	const float *b  = stored[SP1_PUI_BASE];
 	const float *sh = stored[SP1_PUI_SHIFT];
 	const float *st = stored[SP1_PUI_SETTINGS];
-	const uint8_t c = SP1_ENGINE_TABLE[slot].centre;
+	const int es = eslot();
+	const uint8_t c = SP1_ENGINE_TABLE[es].centre;
+	/* ---- MIDI is driving the pitch: the quantizer stands aside (M5a, Adara) ----
+	 * While MIDI is active the FREQUENCY scale is bypassed -- no quantizing, no note
+	 * latch, and mode 9 back to whole octaves. The selected scale is kept and returns at
+	 * disconnect. */
+	const bool quantize = scale >= 0 && !sp1_midi_active();
 
 	/* ---- FREQUENCY: Plaits' range modes, plaits/ui.cc ----
 	 *  0      LFO range           -48.37 + 60t          (no detent: centre arbitrary)
@@ -326,7 +408,13 @@ void sp1_pui_params(struct sp1_synth_params *p)
 	/* The scale, if one is selected (M4b). Fetched once: it also decides what mode 9
 	 * means. `degrees` is empty when no scale is on. */
 	float degrees[16];
-	const int n_deg = (scale >= 0) ? sp1_marbles_plaits_degrees(degrees, 16) : 0;
+	const int n_deg = quantize ? sp1_marbles_plaits_degrees(degrees, 16) : 0;
+	/* MIDI's FREQUENCY CC (M5a). Mode 9 makes F1 a switch, so there the CC moves the
+	 * position BEFORE it is quantized and steps like the fader does; everywhere else the
+	 * audio thread adds it, smoothed, at freq_per_travel semitones per unit of travel. */
+	const float f1 = (oct == 9)
+		? clamp01(b[0] + sp1_midi_offset(SP1_MIDI_D_FREQUENCY)) : b[0];
+	p->freq_per_travel = oct == 0 ? 120.0f : (oct == 9 ? 0.0f : (oct == 10 ? 96.0f : 14.0f));
 	float note;
 	if (oct == 0) {
 		/* LFO range: never quantized. Its "notes" are rates (Adara). */
@@ -339,7 +427,7 @@ void sp1_pui_params(struct sp1_synth_params *p)
 		 * order, across the same nine octaves. Seven degrees gives 63 steps, about
 		 * 59 fader counts each. Same asymmetric hysteresis as the octave version. */
 		const int steps = 9 * n_deg;
-		const float v = b[0] * (float)steps - 0.5f;
+		const float v = f1 * (float)steps - 0.5f;
 		const float h = v > (float)deg_q ? -0.01f : 0.01f;
 		int q = (int)(v + h + 0.5f);
 		q = q < 0 ? 0 : (q > steps - 1 ? steps - 1 : q);
@@ -347,14 +435,15 @@ void sp1_pui_params(struct sp1_synth_params *p)
 		note = 60.0f + 12.0f * (float)(q / n_deg - 4) + degrees[q % n_deg];
 	} else if (oct == 9) {
 		/* stmlib HysteresisQuantizer2(9 steps, 0.01, asymmetric) */
-		const float v = b[0] * 9.0f - 0.5f;
+		const float v = f1 * 9.0f - 0.5f;
 		const float h = v > (float)oct_q ? -0.01f : 0.01f;
 		int q = (int)(v + h + 0.5f);
 		q = q < 0 ? 0 : (q > 8 ? 8 : q);
 		oct_q = q;
 		note = 53.0f + 0.5f * 14.0f + 12.0f * (float)(q - 4);   /* fine at centre */
 	} else {
-		const float t = 2.0f * detent(b[0], DETENT_FREQ) - 1.0f;
+		const float t = 2.0f * detent(b[0], sp1_midi_active() ? DETENT_FREQ_MIDI
+								      : DETENT_FREQ) - 1.0f;
 		note = (oct == 10) ? 60.0f + t * 48.0f : t * 7.0f + (float)oct * 12.0f;
 		if (n_deg > 0) {
 			/* Modes 1-8 and 10: the range decides the SPAN, the scale decides
@@ -367,7 +456,7 @@ void sp1_pui_params(struct sp1_synth_params *p)
 	 * Only while a scale is selected. The latch itself is in sp1_synth.cc because that is
 	 * the only place TRIG exists; all the UI does is say "this note is on a grid, so it
 	 * should not slide under a decaying voice". Without a scale, F1 stays continuous. */
-	p->note_hold = (scale != SP1_PUI_SCALE_OFF) ? 1 : 0;
+	p->note_hold = quantize ? 1 : 0;
 
 	p->timbre    = (c & C_T) ? detent(b[1], DETENT_BIPOLAR) : clamp01(b[1]);
 	p->morph     = (c & C_M) ? detent(b[2], DETENT_BIPOLAR) : clamp01(b[2]);
@@ -383,8 +472,12 @@ void sp1_pui_params(struct sp1_synth_params *p)
 	p->harm_mod   = 2.0f * detent(sh[3], DETENT_BIPOLAR) - 1.0f;
 
 	/* LEVEL (SETTINGS F4 since M4a): below 5 % disconnected; above, 0..1 over the
-	 * remaining travel. */
-	if (st[3] < LEVEL_OFF) {
+	 * remaining travel. MIDI's LEVEL CC moves the fader position (M5a), so it can connect
+	 * a disconnected LEVEL exactly as pushing the fader up would; the threshold is decided
+	 * here on its target, and the audio thread adds its smoothed value to level_pos. */
+	const float lpos = st[3] + sp1_midi_offset(SP1_MIDI_D_LEVEL);
+	p->level_pos = clamp01(st[3]);
+	if (lpos < LEVEL_OFF) {
 		p->level_patched = 0;
 		p->level = 0.0f;
 	} else {
@@ -394,7 +487,8 @@ void sp1_pui_params(struct sp1_synth_params *p)
 
 	p->lpg_colour = clamp01(st[1]);
 	p->decay      = clamp01(st[2]);
-	p->engine     = SP1_ENGINE_TABLE[slot].plaits;
+	p->engine     = SP1_ENGINE_TABLE[es].plaits;
+	p->engine_centre = c;          /* how a MIDI CC on F2-F4 reads (sp1_midi.h) */
 }
 
 static void leds_of(enum sp1_pui_layer l, uint8_t out[4])
@@ -425,9 +519,9 @@ enum sp1_pui_layer sp1_pui_active(void) { return active; }
 enum sp1_pui_layer sp1_pui_page(void)   { return page; }
 bool sp1_pui_catching(int f)            { return f >= 0 && f < 4 && catching[active][f]; }
 bool sp1_pui_level_connected(void)      { return stored[SP1_PUI_SETTINGS][3] >= LEVEL_OFF; }
-int  sp1_pui_engine(void)               { return SP1_ENGINE_TABLE[slot].plaits; }
+int  sp1_pui_engine(void)               { return SP1_ENGINE_TABLE[eslot()].plaits; }
 int  sp1_pui_slot(void)                 { return slot; }
-uint8_t sp1_pui_engine_centre(void)     { return SP1_ENGINE_TABLE[slot].centre; }
+uint8_t sp1_pui_engine_centre(void)     { return SP1_ENGINE_TABLE[eslot()].centre; }
 int  sp1_pui_scale(void)                { return scale; }
 
 void sp1_pui_set_scale(int s)
@@ -483,13 +577,25 @@ void sp1_pui_rip(void)
 
 void sp1_pui_engine_leds(uint8_t out[4])
 {
+	/* The engine PLAYING, not the one T2/T3 selected (Adara, M5a): with MIDI's MODEL CC
+	 * offsetting the selection, the glyph has to show what you hear. Without a MODEL offset
+	 * the two are the same slot. */
+	sp1_pui_slot_leds(eslot(), out);
+}
+const char *sp1_pui_engine_name(void)   { return SP1_ENGINE_TABLE[eslot()].name; }
+int  sp1_pui_eslot(void)                { return eslot(); }
+
+void sp1_pui_slot_leds(int s, uint8_t out[4])
+{
 	static const uint8_t L[3] = { 0u, SP1_ENGINE_LED_HALF, SP1_ENGINE_LED_FULL };
+	if (s < 0 || s >= SP1_ENGINE_SLOTS) {
+		s = slot;
+	}
 	for (int i = 0; i < 4; i++) {
-		const uint8_t k = SP1_ENGINE_TABLE[slot].led[i];
+		const uint8_t k = SP1_ENGINE_TABLE[s].led[i];
 		out[i] = L[k < 3u ? k : 0u];
 	}
 }
-const char *sp1_pui_engine_name(void)   { return SP1_ENGINE_TABLE[slot].name; }
 
 /* ---- engine select (T2 / T3), in SLOT order from config/engines.csv ----
  * A slot with no engine in the CSV is empty: it keeps its place and glyph, and is

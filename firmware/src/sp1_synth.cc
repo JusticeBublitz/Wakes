@@ -9,6 +9,9 @@
 #include "sp1_synth.h"
 #include "sp1_marbles.h"
 #include "sp1_marbles_ui.h"
+#if defined(CONFIG_SP1_MIDI)
+#include "sp1_midi.h"
+#endif
 
 #include <atomic>
 #include <cmath>
@@ -118,6 +121,13 @@ const float kMaxHarm = 1.0f;
 inline float Clamp(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
+
+inline float Clamp01(float v) {
+  return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+// The LEVEL fader (SETTINGS F4): below this it is DISCONNECTED (sp1_plaits_ui.c, LEVEL_OFF).
+const float kLevelOff = 0.05f;
 
 inline int16_t Sat16(int32_t v) {
   return static_cast<int16_t>(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
@@ -399,6 +409,9 @@ extern "C" void sp1_synth_init(void) {
   d.lpg_colour = 0.0f;
   d.level = 0.0f;
   d.level_patched = 0;
+  d.level_pos = 0.0f;
+  d.engine_centre = 0u;
+  d.freq_per_travel = 96.0f;
   d.engine = SP1_SYNTH_ENGINE_INITIAL;
   for (int k = 0; k < 3; ++k) {
     d.mrb_t_dest[k] = SP1_DEST_NONE;
@@ -421,6 +434,7 @@ sp1_synth_profile prof;                      // audio thread: spans of the last 
 inline uint32_t Now() {
   return cyc_counter ? *cyc_counter : 0u;
 }
+uint32_t (*midi_clock)(void);                // NULL = untimed (sp1_synth_set_midi_clock)
 
 extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
   const uint32_t prof_t0 = Now();
@@ -472,6 +486,23 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
     pulse_started = true;
   }
 
+#if defined(CONFIG_SP1_MIDI)
+  // ---- MIDI (M5a): this audio block's messages, each placed at its Plaits block, and the
+  // CC offsets, smoothed once per audio block (sp1_midi.h). Taken BEFORE Marbles renders:
+  // this block's clock ticks and transport are Marbles' clock (M5b). ----
+  float moff[SP1_MIDI_AUDIO_DESTS];
+  const bool midi = sp1_midi_audio_begin(midi_clock ? midi_clock() : 0u, frames / plaits::kBlockSize, c.engine_centre,
+                                         moff);
+  {
+    static_assert(SP1_MIDI_TP_START == SP1_MRB_TP_START &&
+                  SP1_MIDI_TP_CONTINUE == SP1_MRB_TP_CONTINUE &&
+                  SP1_MIDI_TP_STOP == SP1_MRB_TP_STOP, "one set of transport codes");
+    sp1_midi_clock clk;
+    sp1_midi_audio_clock(&clk);
+    sp1_marbles_clock(clk.external ? clk.beats : nullptr, clk.transport);
+  }
+#endif
+
   // Marbles, one sample per Plaits block (the 4 kHz rule, sp1_marbles.h). Stopped,
   // it renders nothing and every Marbles input below stays unpatched.
   const bool mrb = sp1_marbles_running();
@@ -519,10 +550,52 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
   float drive_g = drive_from;
   drive_gain_prev = drive_target;
 
+#if defined(CONFIG_SP1_MIDI)
+  // ---- MIDI's CC offsets (M5a), taken above ----
+  // A CC is a second hand on its fader: the offset is in fader-travel units, so a unipolar
+  // parameter takes it as is and an attenuverter (-1..+1, two units of value per unit of
+  // travel) takes twice it. Clamped to the parameter's range, as the fader is. Applied ONCE
+  // here: the offsets are constant across the audio block. With MIDI idle -- nothing plugged
+  // in, or nothing ever sent -- `midi` is false and nothing below runs per Plaits block.
+  if (midi) {
+    patch.timbre = Clamp01(c.timbre + moff[SP1_MIDI_D_TIMBRE]);
+    patch.morph = Clamp01(c.morph + moff[SP1_MIDI_D_MORPH]);
+    patch.harmonics = Clamp01(c.harmonics + moff[SP1_MIDI_D_HARMONICS]);
+    patch.frequency_modulation_amount =
+        Clamp(c.fm_mod + 2.0f * moff[SP1_MIDI_D_FM_ATTENUVERTER], -1.0f, 1.0f);
+    patch.timbre_modulation_amount =
+        Clamp(c.timbre_mod + 2.0f * moff[SP1_MIDI_D_TIMBRE_ATTENUVERTER], -1.0f, 1.0f);
+    patch.morph_modulation_amount =
+        Clamp(c.morph_mod + 2.0f * moff[SP1_MIDI_D_MORPH_ATTENUVERTER], -1.0f, 1.0f);
+    patch.harmonics_modulation_amount =
+        Clamp(c.harm_mod + 2.0f * moff[SP1_MIDI_D_HARMONICS_ATTENUVERTER], -1.0f, 1.0f);
+    patch.lpg_colour = Clamp01(c.lpg_colour + moff[SP1_MIDI_D_LPG_COLOUR]);
+    patch.decay = Clamp01(c.decay + moff[SP1_MIDI_D_LPG_DECAY]);
+  }
+  // The LEVEL fader with its CC, and the FREQUENCY CC in semitones: per audio block too.
+  const float midi_level_fader = (midi && level_fader_patched)
+      ? Clamp01((c.level_pos + moff[SP1_MIDI_D_LEVEL] - kLevelOff) / (1.0f - kLevelOff))
+      : 0.0f;
+  const float midi_freq = midi ? moff[SP1_MIDI_D_FREQUENCY] * c.freq_per_travel : 0.0f;
+#endif
+
   float v[plaits::kBlockSize];
   uint32_t j = 0;                      // Plaits block index = Marbles frame index
   while (frames >= plaits::kBlockSize) {
     bool new_edge = pulse_started && j == 0;
+#if defined(CONFIG_SP1_MIDI)
+    // ---- MIDI into Plaits (M5a), one Plaits block at a time: the strike, the gate and the
+    // pitch. A note-on strikes TRIG here, joining every other TRIG source (RWD, the burst, a
+    // routed t gate) through the same pulse and re-strike logic below. ----
+    sp1_midi_frame mf = { false, false, 0.0f, 0.0f };
+    if (midi) {
+      sp1_midi_audio_block(j, &mf);
+      if (mf.trig) {
+        trig_blocks_left = kTrigBlocks;
+        new_edge = true;
+      }
+    }
+#endif
     if (burst_on && mrb) {
       // ---- running: the grid IS Marbles' clock ----
       const float ramp = mrb_ramp[j];
@@ -637,7 +710,19 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
     mods.harmonics_patched = harm_patched;
     // LEVEL comes from the SETTINGS fader, a Marbles route, or both (they add).
     mods.level_patched = level_fader_patched || level_routed;
-    mods.level = Clamp(c.level + m_level, 0.0f, 1.0f);
+    float level_value = c.level + m_level;
+#if defined(CONFIG_SP1_MIDI)
+    // ...and from MIDI (M5a): its CC moves the fader position, and a held key -- or the
+    // release after it -- connects LEVEL and holds it open at the gate's height, so Plaits
+    // sustains while the key is down and closes through its LPG when it comes up. Only
+    // while a key or its release is sounding (Adara, C: option a), so a Marbles pattern
+    // that only uses TRIG is not silenced by a MIDI port that is merely plugged in.
+    if (midi) {
+      level_value = midi_level_fader + m_level + (mf.owns_level ? mf.gate : 0.0f);
+      mods.level_patched = mods.level_patched || mf.owns_level;
+    }
+#endif
+    mods.level = Clamp(level_value, 0.0f, 1.0f);
 
     // ---- hold the note between TRIGs, while a scale is selected (M4e, Adara) ----
     // `new_edge` is every TRIG source at once -- RWD, the burst, and a routed Marbles t
@@ -657,6 +742,14 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
       note_held_valid = false;         // re-latch on the first TRIG after it comes back
       patch.note = c.note;
     }
+#if defined(CONFIG_SP1_MIDI)
+    // MIDI pitch (M5a): added like a V/Oct cable, note 60 = +0, and OUTSIDE the latch --
+    // in legato a new note arrives without a TRIG and must still be heard. The FREQUENCY
+    // CC moves F1, scaled by the octave range (sp1_synth.h, freq_per_travel).
+    if (midi) {
+      patch.note += mf.note + midi_freq;
+    }
+#endif
     ++j;
     const uint32_t prof_e0 = Now();
     if (fading) {
@@ -668,6 +761,12 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
     }
     const uint32_t prof_e1 = Now();
     prof_eng += prof_e1 - prof_e0;
+#if defined(CONFIG_SP1_MIDI)
+    // When a released note's LPG has closed, MIDI lets go of LEVEL (sp1_midi.h).
+    if (midi) {
+      sp1_midi_audio_lpg(voice->sp1_lpg_gain(), voice->sp1_lpg_bypassed());
+    }
+#endif
     if (drive_inc == 0.0f) {
       StageBlockAny(limiting, driving, v, out, drive_g);
     } else {
@@ -688,6 +787,10 @@ extern "C" void sp1_synth_render(int16_t* out, uint32_t frames) {
 
 extern "C" void sp1_synth_set_cycle_counter(const volatile uint32_t* counter) {
   cyc_counter = counter;
+}
+
+extern "C" void sp1_synth_set_midi_clock(uint32_t (*now)(void)) {
+  midi_clock = now;
 }
 
 extern "C" void sp1_synth_last_profile(sp1_synth_profile* out) {
@@ -780,6 +883,8 @@ static_assert(plaits::Patch::kSp1HarmonicsAttenuverter,
 static_assert(plaits::Ensemble::kSp1Override, "Ensemble replacement not applied");
 static_assert(plaits::StringSynthOscillator::kSp1Override,
               "String-synth oscillator replacement not applied");
+static_assert(plaits::Voice::kSp1LpgState,
+              "voice.h replacement not applied: no LPG state for MIDI (M5a)");
 static_assert(plaits::Voice::kSp1SingleLpg,
               "voice.h replacement not applied: two low-pass gates");
 static_assert(plaits::VariableShapeOscillator::kSp1Override &&

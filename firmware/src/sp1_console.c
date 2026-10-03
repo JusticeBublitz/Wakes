@@ -1,10 +1,10 @@
 /*
  * wakes-sp1 — USB CDC ACM console. See sp1_console.h.
  *
- * Uses Zephyr's device_next USB stack via the samples' usbd helper, which is the
- * path chattock/sp1-tape-looper proved on this board and this Zephyr version. The
- * legacy CONFIG_USB_DEVICE_STACK is smaller but deprecated, and mass storage later
- * would need device_next anyway. See docs/BUILD.md if the helper is unavailable.
+ * Uses Zephyr's device_next USB stack, the path chattock/sp1-tape-looper proved on this
+ * board and this Zephyr version. The legacy CONFIG_USB_DEVICE_STACK is smaller but
+ * deprecated. Since M5a the USB device itself -- identity, every function on it -- is
+ * sp1_usbd.c; this file is only the CDC ACM console that rides on it.
  */
 #include "sp1_console.h"
 #include "sp1_batt.h"
@@ -14,11 +14,10 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
-#include <zephyr/usb/usbd.h>
-#include <sample_usbd.h>
+#include "sp1_usbd.h"
+#include "sp1_logbuf.h"
 #include <zephyr/app_version.h>   /* generated from firmware/VERSION */
 
-static struct usbd_context *usbd;
 static bool up;
 
 /* The console device itself, so DTR can be watched. */
@@ -160,11 +159,7 @@ void sp1_console_pace(void)
 
 int sp1_console_init(void)
 {
-	usbd = sample_usbd_init_device(NULL);
-	if (usbd == NULL) {
-		return -1;
-	}
-	if (usbd_enable(usbd) != 0) {
+	if (sp1_usbd_init() != 0) {
 		return -1;
 	}
 	up = true;
@@ -206,12 +201,25 @@ void sp1_console_poll(uint32_t elapsed_ms, const char *state)
 		uint32_t dtr = 0;
 		if (uart_line_ctrl_get(cdc, UART_LINE_CTRL_DTR, &dtr) == 0) {
 			const bool now = (dtr != 0);
-			if (now && !dtr_prev && boot_info.valid) {
-				print_banner();
+			if (now && !dtr_prev) {
+				/* The banner again (not stored twice), then everything stored
+				 * since boot -- an OP-XY session, a stretch on battery
+				 * (sp1_logbuf.h). */
+				if (boot_info.valid) {
+					sp1_logbuf_hold(true);
+					print_banner();
+					sp1_logbuf_hold(false);
+				}
+				sp1_logbuf_replay_start();
+			} else if (!now && dtr_prev) {
+				sp1_logbuf_replay_stop();   /* nobody is listening any more */
 			}
 			dtr_prev = now;
 		}
 	}
+	/* The stored log, a step per tick: paced for CDC ACM, and the loop goes on feeding
+	 * the watchdog in between. */
+	sp1_logbuf_replay_step();
 
 	if (raw_capture) {
 		raw_acc += elapsed_ms;

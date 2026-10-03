@@ -100,6 +100,10 @@ void sp1_pui_resume(const uint16_t raw[4], bool fnc);
 #define SP1_PUI_EV_LEVEL   0x100u    /* LEVEL connected/disconnected                 */
 uint32_t sp1_pui_tick(uint32_t elapsed_ms, const uint16_t raw[4], bool valid,
 		      bool fnc, bool activity);
+/* Every tick, whichever module is on show, after sp1_midi_main_tick: MIDI CCs move the
+ * stored values themselves when the script's pickup is shared or takeover (sp1_midi.h).
+ * Does nothing in sum. */
+void sp1_pui_midi(void);
 
 /* What the synth should play, from all three layers. */
 void sp1_pui_params(struct sp1_synth_params *out);
@@ -153,6 +157,11 @@ int  sp1_pui_engine(void);                     /* Plaits engine index (voice.cc)
  * Marbles' INTELLIGENT voltage range reads it (M4c) and so does the rip's neutral state. */
 uint8_t sp1_pui_engine_centre(void);
 int  sp1_pui_slot(void);                       /* 0-based position in the list   */
+/* The slot actually PLAYING: sp1_pui_slot() moved by MIDI's MODEL CC (M5a). Equal to the
+ * selection while no MODEL CC is applied. */
+int  sp1_pui_eslot(void);
+/* A slot's glyph as LED levels (any slot; out of range = the selection). */
+void sp1_pui_slot_leds(int slot, uint8_t out[4]);
 
 /* "••" + PLAY held 3 s ("rip out the cables"): a **FULL PATCH WIPE** on PLAITS
  * (Adara, M4d — docs/DEFAULTS.md is the spec).
@@ -171,7 +180,8 @@ int  sp1_pui_slot(void);                       /* 0-based position in the list  
  * ⚠️ The faders do not move; pickup catches them up (Adara: by design). */
 void sp1_pui_rip(void);
 const char *sp1_pui_engine_name(void);
-/* The current slot's glyph as LED levels (fixed per slot, tools/gen_engines.py). */
+/* The glyph of the engine PLAYING (sp1_pui_eslot: the selection moved by MIDI's MODEL CC) as
+ * LED levels -- fixed per slot, tools/gen_engines.py. What T1, T2/T3 and the module swap flash. */
 void sp1_pui_engine_leds(uint8_t out[4]);
 /* T3 = +1, T2 = -1. Wraps; skips empty slots. Returns the new SLOT. */
 int  sp1_pui_engine_step(int dir);

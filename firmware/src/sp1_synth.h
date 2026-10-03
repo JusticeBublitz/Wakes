@@ -60,6 +60,19 @@ struct sp1_synth_params {
 	float decay, lpg_colour;                 /* 0..1 (settings page)            */
 	float level;                   /* 0..1, only meaningful if level_patched      */
 	int   level_patched;           /* 0: LPG triggered by PLAY; 1: VCA held open  */
+	/* ---- what MIDI needs to apply its offsets in the audio thread (M5a) ----
+	 * A MIDI CC moves a parameter like a second hand on its fader (sp1_midi.h), smoothed
+	 * per Plaits block. LEVEL's CC acts on the fader POSITION -- below 5 % is
+	 * "disconnected" -- so the raw position is passed alongside; level_patched above has
+	 * already counted the CC (the control loop decides the connect threshold). And
+	 * FREQUENCY's CC moves F1, whose semitones per unit of travel depend on the octave
+	 * range: 96 in the full range, 14 in modes 1-8, 120 in LFO mode, and 0 in mode 9,
+	 * where F1 is a switch and the control loop applies the CC before quantizing. */
+	float level_pos;               /* SETTINGS F4, 0..1, as stored               */
+	/* The playing engine's bipolar parameters, SP1_ENGINE_TABLE[].centre (0x1 HARMONICS,
+	 * 0x2 TIMBRE, 0x4 MORPH): decides how a MIDI CC on those three reads (sp1_midi.h). */
+	uint8_t engine_centre;
+	float freq_per_travel;         /* semitones per whole fader travel           */
 	int   engine;                  /* Plaits engine index                         */
 	/* Marbles -> Plaits (M4). Applied ONLY while Marbles' clock runs
 	 * (sp1_marbles_running); stopped, every one of these inputs is unpatched. */
@@ -204,6 +217,9 @@ struct sp1_synth_profile {
 	uint32_t total, mrb, eng, post;
 };
 void sp1_synth_set_cycle_counter(const volatile uint32_t *counter);
+/* MIDI's clock (sp1_midi.h, "timing"): the same clock the USB side stamps messages with --
+ * NOT the cycle counter, which stops while the CPU sleeps. NULL (the default) = untimed. */
+void sp1_synth_set_midi_clock(uint32_t (*now)(void));
 /* AUDIO THREAD: the spans of the last sp1_synth_render() call. */
 void sp1_synth_last_profile(struct sp1_synth_profile *out);
 

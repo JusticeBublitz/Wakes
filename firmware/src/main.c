@@ -74,7 +74,10 @@
 #include "sp1_ui_timing.h"
 #include "sp1_batt.h"
 #include "sp1_standby.h"
+#include "sp1_usbd.h"
 #include "sp1_console.h"
+#include "sp1_logbuf.h"
+#include "sp1_threads.h"
 #include "sp1_controls.h"
 #include "sp1_display.h"
 #include "sp1_calib.h"
@@ -87,6 +90,7 @@
 #include "sp1_marbles.h"
 #include "sp1_marbles_ui.h"
 #include "sp1_release_guard.h"
+#include "sp1_midi.h"
 #endif
 
 #define WDT_NODE DT_ALIAS(watchdog0)
@@ -258,6 +262,206 @@ static void unpatch_levels(uint32_t t, uint8_t lv[4])
 	lv[3] = (uint8_t)out;
 }
 
+#if defined(CONFIG_SP1_PLAITS)
+/* The tempo the synth's FFWD burst uses while Marbles is stopped (running, the burst locks to
+ * Marbles' ramp): Marbles' RATE, or the host's beat while MIDI clocks Marbles (M5b). */
+static float tempo_bpm(void)
+{
+#if defined(CONFIG_SP1_MIDI)
+	struct sp1_midi_stats ms;
+	sp1_midi_get_stats(&ms);
+	if (ms.clock_ext && ms.bpm10 != 0u) {
+		return (float)ms.bpm10 * 0.1f;
+	}
+#endif
+	return sp1_mui_bpm();
+}
+#endif
+
+/* ================= the MIDI prompt (M5a, Adara; M5 plan B9) =================
+ * MIDI plugged in: the Unpatch animation REVERSED -- light gathers from T1/T4 inwards, drops,
+ * blinks, and rises to full: the cable going in. Unplugged: the Unpatch animation as it is,
+ * because a disconnect really is every MIDI cable coming out (everything MIDI did goes back
+ * to neutral). The picture is unpatch_levels() run backwards or forwards, so the two can never
+ * drift apart.
+ *
+ * "Plugged in" = the HOST ENABLED the MIDI port, not the first message: the first note would
+ * otherwise fire a 750 ms animation over the playing, and a charger never enumerates so it
+ * never prompts. Held SP1_MIDI_PROMPT_SETTLE_MS first, because hosts reset the bus while
+ * enumerating; and "unplugged" is only shown after "plugged in" was, so a flap cannot play it
+ * alone. Entering ON with a host attached shows "plugged in" once (C10).
+ *
+ * ⚠️ Cosmetic and nothing else: it draws through sp1_display_flash like every other overlay,
+ * so the shutdown animation and the backstop warning always win (rule 5a), and a rip or an
+ * Unpatch hold on the same row makes it stand down. */
+#if defined(CONFIG_SP1_MIDI)
+static uint32_t midi_up_ms;            /* how long the port has been up, capped      */
+static bool     midi_prompted;         /* "plugged in" shown for this connection     */
+static int      midi_anim;             /* +1 plugged in (reversed), -1 unplugged, 0  */
+static uint32_t midi_anim_ms;
+static bool     midi_port_was;
+static bool     midi_active_was;
+static int      midi_eslot_was;        /* the engine PLAYING at the last tick */
+static int      midi_sel_was;          /* ...and the one T2/T3 selected        */
+static uint32_t midi_drop0;            /* queue drops before this ON (device was off) */
+static bool     midi_clk_was;          /* Marbles was on MIDI's clock at the last tick */
+static uint32_t midi_tp_seen[5];       /* starts, continues, stops, MMC play / stop logged */
+
+/* The prompt's state on entry to ON. (MIDI itself was reset before audio started.) */
+static void midi_enter(void)
+{
+	midi_up_ms = 0u;
+	midi_prompted = false;
+	midi_anim = 0;
+	midi_port_was = sp1_midi_port_up();
+	midi_active_was = false;
+	midi_eslot_was = sp1_pui_eslot();
+	midi_sel_was = sp1_pui_slot();
+	{
+		struct sp1_midi_stats ms;
+		sp1_midi_get_stats(&ms);
+		midi_drop0 = ms.dropped;
+		midi_clk_was = false;
+		midi_tp_seen[0] = ms.starts;
+		midi_tp_seen[1] = ms.continues;
+		midi_tp_seen[2] = ms.stops;
+		midi_tp_seen[3] = ms.mmc_play;
+		midi_tp_seen[4] = ms.mmc_stop;
+	}
+}
+
+/* One control tick. `busy` = something else owns the track row (shutdown, rip, Unpatch). */
+static void midi_tick(uint32_t dt, bool busy)
+{
+	const bool up = sp1_midi_port_up();
+	if (up != midi_port_was) {
+		midi_port_was = up;
+		/* The script's pickup (config/midi.ini), so a log says which one was flashed. */
+		static const char *const pickup[] = {
+			[SP1_MIDI_PICKUP_SUM]      = "sum: CCs offset the faders",
+			[SP1_MIDI_PICKUP_SHARED]   = "shared: CCs and faders share each value",
+			[SP1_MIDI_PICKUP_TAKEOVER] = "takeover: faders with a CC rest until unplugged",
+		};
+		if (up) {
+			printk("MIDI port enabled by the host (pickup %s)\n",
+			       pickup[SP1_MIDI_PICKUP]);
+			/* A host can start Marbles before PLAY ever has (M5b), so seed its
+			 * random stream now if PLAY has not: the moment a host enumerates
+			 * varies as much as the moment of a first PLAY. */
+			if (!g_seeded && !sp1_marbles_running()) {
+				sp1_marbles_seed(k_cycle_get_32());
+				g_seeded = true;
+			}
+		} else {
+			printk("MIDI port gone\n");
+		}
+	}
+	const bool active = sp1_midi_active();
+	if (active != midi_active_was) {
+		midi_active_was = active;
+		printk("MIDI %s\n", active
+		       ? "active: notes and CCs reach Wakes, FREQUENCY quantizer bypassed"
+		       : "neutral: notes released, offsets back to zero");
+	}
+
+	/* ---- MIDI clock and transport (M5b): log what the host did to Marbles ---- */
+	{
+		struct sp1_midi_stats ms;
+		sp1_midi_get_stats(&ms);
+		if (ms.clock_ext != midi_clk_was) {
+			midi_clk_was = ms.clock_ext;
+			printk("CLOCK %s\n", ms.clock_ext
+			       ? "external: Marbles follows MIDI clock, RATE picks the ratio"
+			       : "own: Marbles back on its RATE tempo");
+		}
+		if (ms.starts != midi_tp_seen[0]) {
+			midi_tp_seen[0] = ms.starts;
+			sp1_playrow_clock_reset();
+			printk("CLOCK run (MIDI Start, beat 1): %u.%u BPM\n", ms.bpm10 / 10u,
+			       ms.bpm10 % 10u);
+		}
+		if (ms.continues != midi_tp_seen[1]) {
+			midi_tp_seen[1] = ms.continues;
+			printk("CLOCK run (MIDI Continue)\n");
+		}
+		if (ms.stops != midi_tp_seen[2]) {
+			midi_tp_seen[2] = ms.stops;
+			printk("CLOCK stop (MIDI Stop)\n");
+		}
+		/* MMC (M5b round 2): the OP-XY's transport. With MIDI clock arriving, Play
+		 * waits for beat 1 like Start (its CLOCK run line follows); without, Marbles
+		 * plays on its own RATE tempo. */
+		if (ms.mmc_play != midi_tp_seen[3]) {
+			midi_tp_seen[3] = ms.mmc_play;
+			printk("CLOCK MMC Play: %s\n", ms.clock_ext
+			       ? "waiting for beat 1 on the host's clock"
+			       : "run on Marbles' own RATE tempo (no MIDI clock arriving)");
+			if (!ms.clock_ext) {
+				sp1_playrow_clock_reset();
+			}
+		}
+		if (ms.mmc_stop != midi_tp_seen[4]) {
+			midi_tp_seen[4] = ms.mmc_stop;
+			printk("CLOCK stop (MMC Stop)\n");
+		}
+	}
+
+	/* ---- MODEL moved by MIDI: the engine flash, exactly as T2/T3 draw it (Adara) ----
+	 * Same call, so the same hold and fade -- one animation for "the engine changed",
+	 * whatever changed it. Only when the engine PLAYING changed while the selection did
+	 * not: a T2/T3 press draws its own flash. Any module, so a change made by the host is
+	 * seen even from the Marbles pages. Stands down while something else owns the row. */
+	const int es = sp1_pui_eslot();
+	const int sel = sp1_pui_slot();
+	if (es != midi_eslot_was && sel == midi_sel_was) {
+		printk("MODEL %s (MIDI)\n", sp1_pui_engine_name());
+		if (!busy) {
+			uint8_t g[4];
+			sp1_pui_engine_leds(g);
+			sp1_display_engine(g);
+		}
+	}
+	midi_eslot_was = es;
+	midi_sel_was = sel;
+
+	if (up) {
+		if (midi_up_ms < SP1_MIDI_PROMPT_SETTLE_MS) {
+			midi_up_ms += dt;
+		}
+	} else {
+		midi_up_ms = 0u;
+	}
+	if (up && !midi_prompted && midi_up_ms >= SP1_MIDI_PROMPT_SETTLE_MS) {
+		midi_prompted = true;
+		midi_anim = busy ? 0 : 1;
+		midi_anim_ms = 0u;
+	} else if (!up && midi_prompted) {
+		midi_prompted = false;
+		midi_anim = busy ? 0 : -1;
+		midi_anim_ms = 0u;
+	}
+	if (midi_anim == 0) {
+		return;
+	}
+	if (busy) {
+		midi_anim = 0;                 /* the hold owns the row: drop, not queue */
+		return;
+	}
+	uint8_t lv[4];
+	midi_anim_ms += dt;
+	if (midi_anim_ms >= SP1_UNPATCH_ANIM_MS) {
+		/* Ends where its last frame is -- full for "plugged in", dark for
+		 * "unplugged" -- and fades back to the page from there. */
+		unpatch_levels(midi_anim > 0 ? 0u : SP1_UNPATCH_ANIM_MS, lv);
+		sp1_display_flash(lv, 0u, SP1_UNPATCH_FADEBACK_MS);
+		midi_anim = 0;
+		return;
+	}
+	unpatch_levels(midi_anim > 0 ? SP1_UNPATCH_ANIM_MS - midi_anim_ms : midi_anim_ms, lv);
+	sp1_display_flash(lv, 100u, SP1_UNPATCH_CANCEL_MS);
+}
+#endif
+
 /* Which T1-T4 is held with "••", or -1. Only ONE at a time: the ladder decodes single
  * presses only (a chord reads as nothing pressed), so this cannot be ambiguous. */
 static int unpatch_held_button(void)
@@ -344,17 +548,24 @@ static void plaits_buttons(bool fnc, bool running, uint32_t dt)
 			uint8_t elv[4];
 			sp1_pui_engine_leds(elv);
 			sp1_display_engine(elv);
-			printk("ENGINE slot %d: %s (plaits %d)  [shown]\n",
-			       sp1_pui_slot() + 1, sp1_pui_engine_name(), sp1_pui_engine());
+			printk("ENGINE slot %d: %s (plaits %d)  [shown]%s\n",
+			       sp1_pui_eslot() + 1, sp1_pui_engine_name(), sp1_pui_engine(),
+			       sp1_pui_eslot() != sp1_pui_slot() ? "  (MODEL offset)" : "");
 		}
 		/* T2 previous engine, T3 next (UI-SPEC). */
 		if (step != 0) {
 			const int sl = sp1_pui_engine_step(step);
 			uint8_t elv[4];
-			sp1_pui_engine_leds(elv);
+			sp1_pui_engine_leds(elv);    /* the engine PLAYING (MODEL offset included) */
 			sp1_display_engine(elv);
-			printk("ENGINE slot %d: %s (plaits %d)\n", sl + 1,
-			       sp1_pui_engine_name(), sp1_pui_engine());
+			if (sp1_pui_eslot() != sl) {
+				printk("ENGINE slot %d selected, slot %d playing: %s (plaits %d)"
+				       "  (MODEL offset)\n", sl + 1, sp1_pui_eslot() + 1,
+				       sp1_pui_engine_name(), sp1_pui_engine());
+			} else {
+				printk("ENGINE slot %d: %s (plaits %d)\n", sl + 1,
+				       sp1_pui_engine_name(), sp1_pui_engine());
+			}
 		}
 	} else {
 		/* ---- SETTINGS: T1 shows the scale, T2 / T3 select it, T4 the output ---- */
@@ -701,6 +912,10 @@ int main(void)
 	sp1_wdt_feed();
 	(void)sp1_console_init();
 	sp1_wdt_feed();
+	/* Keep everything printed from here on, for whoever opens the console later -- the
+	 * OP-XY holds the USB port during a session (sp1_logbuf.h). Before the banner, so
+	 * the stored log starts with it. */
+	sp1_logbuf_init(resetreas);
 	sp1_console_banner(resetreas, had_fault, last_reason, last_pc);
 
 	/* If the previous boot ended in a fault, pulse the model row twice. With no
@@ -785,6 +1000,7 @@ int main(void)
 		 * way to SYSTEM_OFF and this loop cannot read a single fader or button
 		 * without it -- the one omission that broke all of M1d-a. Idempotent. */
 		sp1_controls_rail_on();
+		bool charge_held = false;      /* charging switched off for a USB host (below) */
 		/* Diagnostics are slowed right down in ON. Not for the average cost
 		 * (~0.07 % at 1 Hz) but because a ~400 us ADC read or an unbounded
 		 * printk inside a 5 ms audio block is a dropout, not a percentage. */
@@ -805,13 +1021,24 @@ int main(void)
 		 * time, not once at boot. Bounded: sp1_audio_start() cannot hang ON.
 		 * The tone always starts OFF -- nothing makes a sound until PLAY. */
 		sp1_audio_tone_set(false);
+#if defined(CONFIG_SP1_MIDI)
+		/* ⚠️ BEFORE the audio thread starts: anything a host sent while the device was
+		 * off is still in the queue, and the first audio block would play it. The audio
+		 * thread honours this request at the top of that first block (sp1_midi.h). */
+		sp1_midi_on_enter();
+#endif
 		{
 			const int arc = sp1_audio_start();
 			struct sp1_audio_stats as;
 			sp1_audio_stats(&as);
-			printk("AUD start rc=%d  i2s_cfg=%d  tas=%s  hp=%s\n", arc,
+			printk("AUD start rc=%d  i2s_cfg=%d  tas=%s  hp=%s  block %u ms x %u queued:"
+			       " ~%u ms in to out\n", arc,
 			       as.cfg_rc, as.tas_ok ? "ok" : "FAIL",
-			       as.hp_ok ? "ok" : "FAIL");
+			       as.hp_ok ? "ok" : "FAIL",
+			       (unsigned)(CONFIG_SP1_AUDIO_BLOCK_FRAMES / 48),
+			       (unsigned)CONFIG_I2S_NRFX_TX_BLOCK_COUNT,
+			       (unsigned)((CONFIG_I2S_NRFX_TX_BLOCK_COUNT + 3) *
+					  (CONFIG_SP1_AUDIO_BLOCK_FRAMES / 48)));
 		}
 		sp1_playrow_reset();
 		uint32_t aud_print = 0;
@@ -828,6 +1055,11 @@ int main(void)
 		rip_show_page = false;
 		sp1_synth_set_burst_div(1u << g_burst_div);
 		sp1_synth_set_output((enum sp1_synth_output)g_out_mode);
+#if defined(CONFIG_SP1_MIDI)
+		/* A host already attached gets its "plugged in" prompt after the power-on fill
+		 * (C10). */
+		midi_enter();
+#endif
 		sp1_synth_burst(0);
 		sp1_marbles_run(false);
 		beats_seen = sp1_marbles_beats();
@@ -1082,6 +1314,22 @@ int main(void)
 			}
 
 			sp1_console_poll(dt, "ON");
+
+			/* ---- no charging while a USB HOST is attached (M5a, Adara) ----
+			 * A battery-powered host -- the OP-XY -- was charging the SP-1 from its own
+			 * battery all session. ON + a host that configured us = charging off; a plain
+			 * charger still charges, and STANDBY always does (sp1_power.h). Re-checked
+			 * every tick, so plugging and unplugging while ON both follow. */
+			{
+				const bool host = sp1_usbd_host();
+				if (host != charge_held) {
+					charge_held = host;
+					sp1_charger_enable(!host);
+					printk("CHARGE %s\n", host
+					       ? "off: a USB host is attached (the SP-1 runs from USB)"
+					       : "on");
+				}
+			}
 
 #if defined(CONFIG_SP1_PLAITS)
 			/* ---- M3b / M4: the two modules (docs/UI-SPEC.md v0.9) ----
@@ -1434,6 +1682,18 @@ int main(void)
 					}
 				}
 
+#if defined(CONFIG_SP1_MIDI)
+				/* ---- MIDI (M5a): the prompt, and the control-loop smoothing of
+				 * the offsets the two UIs are about to read ---- */
+				midi_tick(dt, shutdown_active || rip_ms > 0u ||
+					  unpatch_ms >= SP1_UNPATCH_START_MS);
+				sp1_midi_main_tick(dt);
+				/* Pickup shared / takeover: the CCs move the stored values of
+				 * BOTH modules, whichever is on show (nothing in sum). */
+				sp1_pui_midi();
+				sp1_mui_midi();
+#endif
+
 				/* ---- publish: Plaits, the routing, Marbles, the tempo ---- */
 				struct sp1_synth_params sp;
 				sp1_pui_params(&sp);
@@ -1454,7 +1714,7 @@ int main(void)
 				 * range follows an engine change while the sequence plays. */
 				mp.engine_centre = sp1_pui_engine_centre();
 				sp1_marbles_set_params(&mp);
-				sp1_synth_set_tempo(sp1_mui_bpm());
+				sp1_synth_set_tempo(tempo_bpm());
 
 				/* ---- the play-row clock steps on Marbles' t2 ---- */
 				const uint32_t b = sp1_marbles_beats();
@@ -1645,6 +1905,55 @@ int main(void)
 				       a10[SP1_SEC_OUT] / 10u, a10[SP1_SEC_OUT] % 10u,
 				       m10[SP1_SEC_OUT] / 10u, m10[SP1_SEC_OUT] % 10u,
 				       sc.over, sc.over_run);
+				/* ...and where the whole CPU went, per thread: the USB stack runs above
+				 * audio, so the sections above cannot show its share (sp1_threads.h). */
+				sp1_threads_report();
+#endif
+#if defined(CONFIG_SP1_MIDI)
+				/* MIDI health, only while a host has the port or something
+				 * arrived (M5a). Totals since boot, except drop: messages lost
+				 * to a full queue since this ON began. While the device is off
+				 * nothing drains the queue, so drops then mean nothing. */
+				{
+					static uint32_t rx_seen;
+					struct sp1_midi_stats ms;
+					sp1_midi_get_stats(&ms);
+					if (sp1_midi_port_up() || ms.received != rx_seen) {
+						rx_seen = ms.received;
+						printk("MIDI port=%d act=%d rx=%u drop=%u notes=%u cc=%u"
+						       " ign=%u held=%u bend=%u clk=%s %u.%u BPM ticks=%u\n",
+						       sp1_midi_port_up() ? 1 : 0,
+						       sp1_midi_active() ? 1 : 0, ms.received,
+						       ms.dropped - midi_drop0, ms.notes, ms.ccs, ms.ignored,
+						       ms.held, ms.bend_range, ms.clock_ext ? "midi" : "own",
+						       ms.bpm10 / 10u, ms.bpm10 % 10u, ms.ticks);
+					}
+					/* Diagnostics (M5b): the host's tick spacing over the last
+					 * 5 s from the USB timestamps (164 BPM = 15.244 ms), the
+					 * transport as RECEIVED, fresh starts of the clock's line,
+					 * and USB packets nothing took. Only when there is news. */
+					static uint32_t rej_seen;
+					uint32_t rej;
+					uint8_t last[4];
+					sp1_midi_usb_rejects(&rej, last);
+					/* cin5: clock / transport that came as CIN 0x5 packets
+					 * and was taken anyway (sp1_usbd.c) -- the OP-XY? */
+					static uint32_t cin5_seen;
+					const uint32_t cin5 = sp1_midi_usb_rt_cin5();
+					if (ms.iv_n > 0u || rej != rej_seen || cin5 != cin5_seen) {
+						rej_seen = rej;
+						cin5_seen = cin5;
+						printk("MIDI clk iv=%u.%03u/%u.%03u/%u.%03u ms (min/avg/max, "
+						       "n=%u) rx start=%u cont=%u stop=%u mmc play=%u stop=%u"
+						       " resets=%u cin5=%u rej=%u last=%02x %02x %02x %02x\n",
+						       ms.iv_min_us / 1000u, ms.iv_min_us % 1000u,
+						       ms.iv_avg_us / 1000u, ms.iv_avg_us % 1000u,
+						       ms.iv_max_us / 1000u, ms.iv_max_us % 1000u, ms.iv_n,
+						       ms.rx_start, ms.rx_cont, ms.rx_stop, ms.mmc_play,
+						       ms.mmc_stop, ms.line_resets,
+						       cin5, rej, last[0], last[1], last[2], last[3]);
+					}
+				}
 #endif
 			}
 
