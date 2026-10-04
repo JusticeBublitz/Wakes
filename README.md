@@ -10,7 +10,7 @@ It runs two Mutable Instruments modules combined:
 - **Marbles**: A playful random sequencer
 
 The development of Wakes is unaffiliated with Teenage Engineering or Mutable Instruments.
-IMPORTANT: Flashing custom firmware on the SP-1 is at your own risk. SP-1s are abandonware, they do not have manufacturer support.
+IMPORTANT: Flashing custom firmware on the SP-1 is at your own risk. SP-1s are abandonware, they do not have manufacturer support. REMEMBER: There is no way to go back to the base firmware once you've flashed it away.
 
 ## 📖 Manual
 
@@ -22,10 +22,11 @@ IMPORTANT: Flashing custom firmware on the SP-1 is at your own risk. SP-1s are a
 
 ## Flashing
 
-1. **[Download the latest `wakes-sp1.bin`](https://github.com/Worldwave/Wakes/releases/latest/download/wakes-sp1.bin)**.
+1. **Download the latest [`wakes-sp1.bin`](https://github.com/Worldwave/Wakes/releases/latest/download/wakes-sp1.bin)**.
    Older versions and release notes are on the [releases page](https://github.com/Worldwave/Wakes/releases).
 2. Open <https://solderless.engineering>. Hold down **T1+T4** while connecting the SP-1 over USB-C.
-3. Select the `.bin` in Solderless Engineering's page, flash it, and once done, you can unplug.
+3. Follow solderless.engineering's instructions on how to connect to your SP-1 to flash it.
+3. Select the `.bin` in Solderless Engineering's "firmware utility" page, flash it, and once done, you can unplug.
 
 The T1+T4 recovery trigger in step 2 lives in Teenage Engineering's bootloader, not in Wakes, so it
 works with whatever firmware is installed. Wakes never writes below `0x20000` (and neither should your CFW's),
