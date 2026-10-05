@@ -25,19 +25,21 @@
  *  I2S stream
  * ========================================================================== */
 #define SR_HZ        48000u
-/* The audio block: CONFIG_SP1_AUDIO_BLOCK_FRAMES, 240 = 5 ms = 20 Plaits blocks of 12 (96 =
- * 2 ms was an M5b trial); M2 had 256, which Plaits' 12-sample block does not divide.
- * Nothing else here depends on the size: the gain ramp and the budget are computed from it.
+/* The audio block: CONFIG_SP1_AUDIO_BLOCK_FRAMES, 96 = 2 ms = 4 Plaits blocks of 24 (#32;
+ * 240 = 5 ms through v0.5.0). M2 had 256, which Plaits' block does not divide. Nothing else
+ * here depends on the size: the gain ramp and the budget are computed from it.
  *
- * ---- latency (Adara, M5b: "over 30 ms is a no-go") ----
+ * ---- latency (Adara, M5b: "over 30 ms is a no-go"; #32: 10 ms) ----
  * When a block starts rendering, the nrfx TX queue (CONFIG_I2S_NRFX_TX_BLOCK_COUNT) is full,
  * the DMA holds the next block and one is playing; and MIDI places each message one block
  * later, at its own moment inside it. So sound leaves Wakes (queue + 3) blocks after what
- * caused it: 5 ms x (4 + 3) = 35 ms through M5a; 2 ms x (2 + 3) = 10 ms was tried and paid
- * ~8 points of CPU in per-block overhead (i2s hand-off, switches, interrupts -- the THREADS
- * line against the block's own cycles); 5 ms x (2 + 3) = 25 ms now. The price is the
- * margin: a block that runs long has (queue + 1) blocks -- 15 ms, was 25 -- before the
- * output runs dry. */
+ * caused it: 5 ms x (4 + 3) = 35 ms through M5a, 5 ms x (2 + 3) = 25 ms in v0.5.0, and
+ * 2 ms x (1 + 3) = 8 ms now (one queued block since the 2026-10-04 MIDI session: 96.8 % peak
+ * against a 200 % margin). 2 ms blocks cost ~6 points of per-block overhead with
+ * 12-sample Plaits blocks (cache refills and fixed setup at every block boundary, #32 step A);
+ * 24-sample Plaits blocks paid for it with room to spare (#32 B1: the heaviest patch at
+ * 76-79 %, no block over budget). The price is the margin: a block that runs long has
+ * (queue + 1) blocks -- 4 ms, was 15 -- before the output runs dry. */
 #define BLK_FRAMES   ((uint32_t)CONFIG_SP1_AUDIO_BLOCK_FRAMES)
 #define BLK_BYTES    (BLK_FRAMES * 2u * sizeof(int16_t))    /* stereo, 16-bit    */
 #define BLK_MS       (BLK_FRAMES / 48u)
@@ -124,10 +126,17 @@ static volatile uint32_t win_max, win_sum, win_n;
  * window and the one above can be read-and-cleared independently. */
 static volatile uint32_t sec_sum[SP1_SEC_N], sec_max[SP1_SEC_N], sec_n;
 static volatile uint32_t over_n, over_run_max;
+static volatile uint32_t pre_sum, pre_max;            /* #32: rte's once-per-block part */
+static volatile uint32_t pre_midi_sum, pre_route_sum; /* #32 B1: two parts of it */
+static volatile uint32_t eng_worst;                   /* #32: slowest engine call */
+static volatile uint8_t eng_worst_engine;
+static volatile bool eng_worst_first;
+static volatile uint32_t miss_sum[SP1_SEC_N], miss_pre_sum;  /* #32, SP1_PROFILE_ICACHE */
 static uint32_t over_run;         /* audio thread only: the run in progress */
 static uint32_t cyc_budget;       /* copy of st.cyc_budget for the audio thread */
 
-static void account_sections(uint32_t cyc)
+/* `miss`: flash-cache misses across the same fill_block (0 unless SP1_PROFILE_ICACHE). */
+static void account_sections(uint32_t cyc, uint32_t miss)
 {
 	uint32_t s[SP1_SEC_N] = { 0u };
 #if defined(CONFIG_SP1_PLAITS)
@@ -138,8 +147,26 @@ static void account_sections(uint32_t cyc)
 	s[SP1_SEC_POST] = p.post;
 	s[SP1_SEC_RTE]  = p.total - p.mrb - p.eng - p.post;
 	s[SP1_SEC_OUT]  = cyc - p.total;
+	pre_sum += p.pre;
+	if (p.eng_worst > eng_worst) {
+		eng_worst = p.eng_worst;
+		eng_worst_engine = p.eng_worst_engine;
+		eng_worst_first = p.eng_worst_first;
+	}
+	pre_midi_sum += p.pre_midi;
+	pre_route_sum += p.pre_route;
+	if (p.pre > pre_max) { pre_max = p.pre; }
+#if defined(CONFIG_SP1_PROFILE_ICACHE)
+	miss_sum[SP1_SEC_ENG]  += p.miss_eng;
+	miss_sum[SP1_SEC_MRB]  += p.miss_mrb;
+	miss_sum[SP1_SEC_POST] += p.miss_post;
+	miss_sum[SP1_SEC_RTE]  += p.miss_total - p.miss_mrb - p.miss_eng - p.miss_post - p.miss_pre;
+	miss_pre_sum           += p.miss_pre;
+	miss_sum[SP1_SEC_OUT]  += miss - p.miss_total;
+#endif
 #else
 	s[SP1_SEC_OUT]  = cyc;
+	ARG_UNUSED(miss);
 #endif
 	for (int i = 0; i < SP1_SEC_N; i++) {
 		sec_sum[i] += s[i];
@@ -405,13 +432,21 @@ static void audio_thread(void *a, void *b, void *c)
 			}
 
 			const uint32_t c0 = DWT->CYCCNT;
+#if defined(CONFIG_SP1_PROFILE_ICACHE)
+			const uint32_t m0 = NRF_NVMC->IMISS;
+#endif
 			fill_block((int16_t *)blk);
 			const uint32_t cyc = DWT->CYCCNT - c0;
+#if defined(CONFIG_SP1_PROFILE_ICACHE)
+			const uint32_t miss = NRF_NVMC->IMISS - m0;
+#else
+			const uint32_t miss = 0u;
+#endif
 			if (cyc > st.cyc_max) { st.cyc_max = cyc; }
 			if (cyc > win_max) { win_max = cyc; }
 			win_sum += cyc;
 			win_n++;
-			account_sections(cyc);
+			account_sections(cyc, miss);
 
 			if (i2s_write(i2s_dev, blk, BLK_BYTES) != 0) {
 				k_mem_slab_free(&tx_slab, blk);
@@ -651,6 +686,15 @@ void sp1_audio_init(void)
 	cyc_budget = st.cyc_budget;
 #if defined(CONFIG_SP1_PLAITS)
 	sp1_synth_set_cycle_counter(&DWT->CYCCNT);
+#if defined(CONFIG_SP1_PROFILE_ICACHE)
+	/* #32 diagnostics: the flash cache's hit/miss counters, read per section by the synth
+	 * and zeroed with each CPU line. Profiling changes nothing about what the cache does.
+	 * Zeroing is safe against a block in progress: main only runs while audio is blocked. */
+	NRF_NVMC->ICACHECNF |= NVMC_ICACHECNF_CACHEPROFEN_Msk;
+	NRF_NVMC->IHIT = 0u;
+	NRF_NVMC->IMISS = 0u;
+	sp1_synth_set_miss_counter(&NRF_NVMC->IMISS);
+#endif
 #endif
 #if defined(CONFIG_SP1_MIDI)
 	sp1_synth_set_midi_clock(midi_now);
@@ -823,6 +867,33 @@ void sp1_audio_take_sections(struct sp1_audio_sections *out)
 	out->over_run = over_run_max;
 	over_n = 0u;
 	over_run_max = 0u;
+	out->blocks = n;
+	out->pre_avg = n ? (pre_sum / n) : 0u;
+	out->pre_max = pre_max;
+	pre_sum = 0u;
+	pre_max = 0u;
+	out->pre_midi_avg = n ? (pre_midi_sum / n) : 0u;
+	out->pre_route_avg = n ? (pre_route_sum / n) : 0u;
+	pre_midi_sum = 0u;
+	pre_route_sum = 0u;
+	for (int i = 0; i < SP1_SEC_N; i++) {
+		out->miss[i] = miss_sum[i];
+		miss_sum[i] = 0u;
+	}
+	out->miss_pre = miss_pre_sum;
+	miss_pre_sum = 0u;
+	out->eng_worst = eng_worst;
+	out->eng_worst_engine = eng_worst_engine;
+	out->eng_worst_first = eng_worst_first;
+	eng_worst = 0u;
+#if defined(CONFIG_SP1_PROFILE_ICACHE)
+	out->icache_hit = NRF_NVMC->IHIT;
+	out->icache_miss = NRF_NVMC->IMISS;
+	NRF_NVMC->IHIT = 0u;
+	NRF_NVMC->IMISS = 0u;
+#else
+	out->icache_hit = out->icache_miss = 0u;
+#endif
 	k_sched_unlock();
 
 	for (int i = 0; i < SP1_SEC_N; i++) {

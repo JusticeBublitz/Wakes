@@ -22,7 +22,8 @@ static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { printf("  FAIL: "); \
   printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
 
-static const uint32_t kBlocks = 20;          // Plaits blocks per audio block
+static const uint32_t kBlocks = 240u / SP1_SYNTH_BLOCK;   // Plaits blocks per 5 ms audio block
+                                                         // (20 of 12 samples, 10 of 24; #32)
 static const double kHz = SP1_MIDI_STAMP_HZ;            // the stamp clock
 static const double kBlockCyc = kHz / 200.0;             // counts per audio block (5 ms)
 static const uint32_t kJust = static_cast<uint32_t>(std::ceil(kHz / 64000.0));   // ~15 us
@@ -190,7 +191,7 @@ int main() {
     for (uint32_t j = 0; j < kBlocks; ++j) {
       if (clk.beats[j] > 0.0f && first < 0) first = static_cast<int>(j);
     }
-    CHECK(first == 10, "the position holds at 0 until beat 1's own Plaits block (10), moved "
+    CHECK(first == int(kBlocks / 2), "the position holds at 0 until beat 1's own Plaits block (half way), moved "
           "at %d", first);
   }
 
@@ -221,7 +222,7 @@ int main() {
     for (uint32_t j = 0; j < kBlocks; ++j) {
       if ((g[j] & 2u) && rise < 0) rise = static_cast<int>(j);
     }
-    CHECK(rise == 5, "Marbles' first beat lands on beat 1's own Plaits block (5), got %d",
+    CHECK(rise == int(kBlocks / 4), "Marbles' first beat lands on beat 1's own Plaits block (a quarter in), got %d",
           rise);
   }
   {
@@ -347,11 +348,13 @@ int main() {
     m /= off.size();
     for (double o : off) v += (o - m) * (o - m);
     const double sd = sqrt(v / off.size());
-    printf("   %zu beats: %.1f ms vs the host's beat (lead %d ms), sd %.2f ms, range %.1f .. %.1f\n",
-           off.size(), m, SP1_MIDI_OUTPUT_LATENCY_MS, sd, lo, hi);
+    // auto = the pipeline + Plaits' TRIG delay (#32): a beat strikes only after both.
+    const double lead = SP1_MIDI_OUTPUT_LATENCY_MS + CONFIG_SP1_TRIGGER_DELAY_SAMPLES / 48.0;
+    printf("   %zu beats: %.1f ms vs the host's beat (lead %.1f ms), sd %.2f ms, range %.1f .. %.1f\n",
+           off.size(), m, lead, sd, lo, hi);
     CHECK(off.size() >= 70u, "Marbles kept time for 30 s: %zu beats", off.size());
-    CHECK(fabs(m + SP1_MIDI_OUTPUT_LATENCY_MS) < 1.5,
-          "on average the lead early: %.1f ms (want -%d)", m, SP1_MIDI_OUTPUT_LATENCY_MS);
+    CHECK(fabs(m + lead) < 1.0,
+          "on average the lead early: %.1f ms (want -%.1f)", m, lead);
     CHECK(sd < 2.0, "the jitter mostly gone: sd %.2f ms against ticks of +-8 ms (sd 4.6)", sd);
     CHECK(hi - lo < 8.0, "no beat strays: spread %.1f ms", hi - lo);
   }
@@ -440,6 +443,77 @@ int main() {
           "over and over: %u restarts", st.line_resets - resets0);
     CHECK(st.bpm10 >= 1195u && st.bpm10 <= 1205u, "...and its tempo is read right: %u.%u",
           st.bpm10 / 10u, st.bpm10 % 10u);
+  }
+
+  // ---- §13 clock_lead = notes (#32): a host whose clock leaves 23 ms after its notes ----
+  // Bitwig measured -23.2 ms (sd 0.3) on hardware. Quantised 16th notes go out 23 ms before
+  // their tick; Wakes should learn a 23 ms lead from them, put Marbles' beats on the NOTES'
+  // grid (23 ms before the clock's), and go back to auto when the cable comes out.
+  if (SP1_MIDI_CLOCK_LEAD_MS == -2) {
+    printf("§13 clock_lead = notes: the host's clock 23 ms after its notes\n");
+    synth();
+    synth();
+    jitter_cyc = Ms(1.0);
+    tempo(135.0);
+    rt(0xFA, now_cyc + kJust);
+    next_tick = now_cyc + 0.6 * kBlockCyc;
+    const double b1 = next_tick, bcyc = tick_cyc * 24.0, skew = Ms(23.0);
+    int note = 0;
+    auto notes = [&]() {                       // every 16th, 23 ms before its tick
+      for (;;) {
+        const double t = b1 + note * (bcyc / 4.0) - skew;
+        if (t >= static_cast<double>(now_cyc)) break;
+        const uint8_t on[3] = { 0x90, 60, 100 }, off_[3] = { 0x80, 60, 0 };
+        sp1_midi_push(on, 3, static_cast<uint32_t>(t));
+        sp1_midi_push(off_, 3, static_cast<uint32_t>(t) + 1u);
+        ++note;
+      }
+    };
+    std::vector<double> off;
+    int beat = -1;
+    bool t2_was = false;
+    for (int i = 0; i < 200 * 30; ++i) {       // 30 s: learn, then measure
+      notes();
+      synth();
+      const uint8_t* g = sp1_marbles_gate_frames();
+      for (uint32_t j = 0; j < kBlocks; ++j) {
+        const bool t2 = (g[j] & 2u) != 0u;
+        if (t2 && !t2_was) {
+          ++beat;
+          const double at = static_cast<double>(now_cyc) - kBlockCyc + j * (kBlockCyc / kBlocks);
+          if (i >= 200 * 15) {                 // after the lead was learnt and followed
+            off.push_back((at - (b1 + beat * bcyc)) / (kHz / 1000.0));
+          }
+        }
+        t2_was = t2;
+      }
+    }
+    sp1_midi_stats st;
+    sp1_midi_get_stats(&st);
+    double m = 0.0;
+    for (double o : off) m += o;
+    m = off.empty() ? 0.0 : m / off.size();
+    printf("   skew %.1f ms (sd %.1f), lead learnt %.1f ms; Marbles' beats %.1f ms vs the "
+           "clock's beat (want -23: on the notes)\n", st.skew_avg_us / 1000.0,
+           st.skew_sd_us / 1000.0, st.lead_us / 1000.0, m);
+    CHECK(fabs(st.skew_avg_us / 1000.0 + 23.0) < 1.0, "the skew measured: %.1f ms (want -23)",
+          st.skew_avg_us / 1000.0);
+    CHECK(fabs(st.lead_us / 1000.0 - 23.0) < 1.0, "the lead learnt: %.1f ms (want 23)",
+          st.lead_us / 1000.0);
+    CHECK(off.size() >= 25u && fabs(m + 23.0) < 1.5,
+          "Marbles on the notes: %.1f ms vs the clock's beat over %zu beats (want -23)", m,
+          off.size());
+    // Pull the cable: a new host has said nothing, so the lead goes back to auto.
+    sp1_midi_port(false);
+    synth();
+    sp1_midi_port(true);
+    seconds(5.5, synth);
+    sp1_midi_get_stats(&st);
+    const double autolead = SP1_MIDI_OUTPUT_LATENCY_MS + CONFIG_SP1_TRIGGER_DELAY_SAMPLES / 48.0;
+    CHECK(fabs(st.lead_us / 1000.0 - autolead) < 0.1,
+          "after a disconnect the lead is auto again: %.1f ms (want %.1f)", st.lead_us / 1000.0,
+          autolead);
+    tempo(0.0);
   }
 
   printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "all checks passed", fails,

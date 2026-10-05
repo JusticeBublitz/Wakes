@@ -9,9 +9,11 @@
  * The USB side (feldd's class, our sp1_usbd.c) only ever calls the two producer functions.
  *
  * ---- threads ----
- *   sp1_midi_push(), sp1_midi_port()        USB thread (Zephyr's usbd thread, cooperative,
- *                                           ABOVE audio). Never block, never take a lock:
- *                                           a lock-free ring, drop-and-count when full.
+ *   sp1_midi_push()                         the USB INTERRUPT (#32: the bulk OUT fast path,
+ *                                           zephyr-patches/udc_nrf-fast-paths.patch; the
+ *                                           usbd thread before). Never block, never take a
+ *                                           lock: a lock-free ring, drop-and-count when full.
+ *   sp1_midi_port()                         the usbd thread (enable / disable / bus events).
  *   sp1_midi_audio_*()                      AUDIO THREAD ONLY (from sp1_synth_render). This
  *                                           is where every message is parsed and every
  *                                           piece of MIDI state lives, so nothing is shared
@@ -108,19 +110,20 @@ extern "C" {
  *   1 block              the message is placed in the NEXT audio block, at its own moment
  *   queue + 2 blocks     when a block starts rendering, the I2S queue is full, the DMA holds
  *                        one more, and one is playing.
- * 5 ms x (4 + 3) = 35 ms through M5a; 2 ms x (2 + 3) = 10 ms tried in M5b (too costly: ~8
- * points of per-block overhead); 5 ms x (2 + 3) = 25 ms now. Taken from the build settings;
- * the host suites, which have none, get 25. Section 7 of the M5 test issue measures it. */
+ * 5 ms x (4 + 3) = 35 ms through M5a, 5 ms x (2 + 3) = 25 ms in v0.5.0, 2 ms x (1 + 3) =
+ * 8 ms since #32. Taken from the build settings; the host suites, which have none, get the
+ * default's 8. Section 7 of the M5 test issue measures it. `clock_lead = auto` adds Plaits'
+ * TRIG delay (CONFIG_SP1_TRIGGER_DELAY_SAMPLES) to it, since a beat sounds only then. */
 #if defined(CONFIG_SP1_AUDIO_BLOCK_FRAMES) && defined(CONFIG_I2S_NRFX_TX_BLOCK_COUNT)
 #define SP1_MIDI_OUTPUT_LATENCY_MS \
 	((CONFIG_I2S_NRFX_TX_BLOCK_COUNT + 3) * (CONFIG_SP1_AUDIO_BLOCK_FRAMES / 48))
 #else
-#define SP1_MIDI_OUTPUT_LATENCY_MS 25
+#define SP1_MIDI_OUTPUT_LATENCY_MS 8
 #endif
 
 #if defined(CONFIG_SP1_MIDI)
 
-/* ---- USB thread ---- */
+/* ---- USB side (the interrupt, and the usbd thread for port changes) ---- */
 /* The stamps' clock, ticks per second: the system clock (CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC,
  * which sp1_usbd.c checks). Any rate works -- placement only uses ratios of spans -- but the
  * tick-spacing diagnostics convert with it. */
@@ -178,6 +181,14 @@ struct sp1_midi_stats {
 	uint32_t iv_n, iv_min_us, iv_avg_us, iv_max_us;
 	uint32_t rx_start, rx_cont, rx_stop, line_resets;
 	uint32_t mmc_play, mmc_stop;  /* MMC Play / Stop acted on (M5b round 2)    */
+	/* #32: where the host's note-ons land on its OWN clock's 16th grid, from their arrival
+	 * stamps, over the last 5 s window -- the host's skew between its notes and its clock,
+	 * which Wakes cannot otherwise see. Negative: notes arrive BEFORE their clock tick
+	 * (the clock leaves late). Meaningful when the notes are quantised (sd small). */
+	uint32_t skew_n;
+	int32_t skew_avg_us;
+	uint32_t skew_sd_us;
+	uint32_t lead_us;             /* #32: the clock lead in use (clock_lead = notes learns it) */
 };
 /* USB packets neither validator took (not channel voice, not clock / transport), and the
  * last of them -- sp1_usbd.c. Diagnostics: what a host sends that Wakes ignores. */

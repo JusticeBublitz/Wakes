@@ -97,7 +97,19 @@ namespace plaits {
 
 const int kMaxEngines = 24;
 const int kMaxTriggerDelay = 8;
-const int kTriggerDelay = 5;
+// The TRIG delay, in Plaits blocks. ⚠️ DelayLine::Read(1) is NO delay (Write moves the
+// pointer back first), so upstream's 5 is FOUR blocks = 1.0 ms, its comment's "1 ms", and
+// 0 would wrap the 8-slot line to SEVEN. #32: kept at 1.0 ms at either block size --
+// 1 + 4 blocks of 12, 1 + 2 of 24. (Shortening it is a separate step with its own A/B.)
+#if defined(CONFIG_SP1_TRIGGER_DELAY_SAMPLES)
+#define SP1_TRIGGER_DELAY_SAMPLES CONFIG_SP1_TRIGGER_DELAY_SAMPLES
+#else
+#define SP1_TRIGGER_DELAY_SAMPLES 48     // upstream's 1.0 ms
+#endif
+const int kTriggerDelay = 1 + SP1_TRIGGER_DELAY_SAMPLES / static_cast<int>(kBlockSize);
+static_assert(SP1_TRIGGER_DELAY_SAMPLES % kBlockSize == 0 &&
+              kTriggerDelay <= kMaxTriggerDelay - 1,
+              "the TRIG delay is whole Plaits blocks, within the delay line");
 
 class ChannelPostProcessor {
  public:

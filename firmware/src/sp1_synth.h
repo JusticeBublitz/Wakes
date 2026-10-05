@@ -32,7 +32,14 @@ extern "C" {
 #endif
 
 /* Plaits renders in blocks of this many samples; sp1_synth_render() needs a multiple. */
+#if defined(CONFIG_SP1_PLAITS_BLOCK)
+#define SP1_SYNTH_BLOCK ((uint32_t)CONFIG_SP1_PLAITS_BLOCK)
+#else
 #define SP1_SYNTH_BLOCK 12u
+#endif
+/* Plaits blocks per millisecond (4 at 12 samples, 2 at 24): the unit every block-counted
+ * time constant of ours is scaled by (#32). */
+#define SP1_SYNTH_BLOCKS_PER_MS (48u / SP1_SYNTH_BLOCK)
 
 /* Engine the voice is constructed with, before the UI publishes its first parameters
  * (plaits/dsp/voice.cc order): virtual analog. Only a placeholder: the UI starts on the
@@ -100,12 +107,12 @@ void sp1_synth_set_params(const struct sp1_synth_params *p);
 
 /* Fire the TRIG input once (RWD pressed). Works whether or not Marbles runs; while it
  * runs, this and the routed t gates both reach TRIG, and a new edge that lands while
- * TRIG is already high is re-struck (one 0.25 ms low block) so it is never lost. */
+ * TRIG is already high is re-struck (one low Plaits block, 0.5 ms) so it is never lost. */
 void sp1_synth_trigger(void);
 
 /* ---- the TRIG burst (M3b; tempo from Marbles since M4; PHASE-LOCKED since M4e) ----
  * A BURST fires TRIGs at 1/div notes of the tempo for as long as it is held on. Timing is
- * quantised to Plaits' 12-sample block, 0.25 ms.
+ * quantised to Plaits' block: 24 samples, 0.5 ms (#32; 12 samples, 0.25 ms, before).
  *
  * ⚠️ Where the grid comes from depends on whether Marbles' clock is RUNNING (M4e, Adara):
  *
@@ -215,8 +222,25 @@ int  sp1_synth_drive_db(int step);     /* the dB at `step`, 0 at step 0 */
  * About 45 counter reads per DMA block, under 0.1 % of the budget. */
 struct sp1_synth_profile {
 	uint32_t total, mrb, eng, post;
+	/* #32: the part of `total - mrb - eng - post` spent BEFORE the Plaits loop -- once per
+	 * audio block (params, MIDI begin, Marbles' clock, routing) -- so the per-block cost
+	 * can be told from the per-Plaits-block glue. */
+	uint32_t pre;
+	/* ...and two parts of it (#32, B1): MIDI's per-block work (begin + the clock handed to
+	 * Marbles) and routing's (ResolveRouting). The rest is params, mixes and drive setup. */
+	uint32_t pre_midi, pre_route;
+	/* #32, CONFIG_SP1_PROFILE_ICACHE: flash-cache misses over the same spans (0 if off). */
+	uint32_t miss_total, miss_mrb, miss_eng, miss_post, miss_pre;
+	/* #32: the slowest single voice->Render() in this audio block, its engine (Plaits
+	 * number) and whether it was the first call after an engine change. */
+	uint32_t eng_worst;
+	uint8_t eng_worst_engine;
+	bool eng_worst_first;
 };
 void sp1_synth_set_cycle_counter(const volatile uint32_t *counter);
+
+/* The flash cache's miss counter (NVMC IMISS), or NULL (the default: no miss profile). */
+void sp1_synth_set_miss_counter(const volatile uint32_t *counter);
 /* MIDI's clock (sp1_midi.h, "timing"): the same clock the USB side stamps messages with --
  * NOT the cycle counter, which stops while the CPU sleeps. NULL (the default) = untimed. */
 void sp1_synth_set_midi_clock(uint32_t (*now)(void));

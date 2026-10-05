@@ -13,6 +13,7 @@
 /* For enum sp1_mui_dest, which INTELLIGENT reads (M4c). sp1_synth.cc includes it for the
  * same reason -- the destination list is UI vocabulary that the DSP glue has to act on. */
 #include "sp1_marbles_ui.h"
+#include "sp1_synth.h"          // SP1_SYNTH_BLOCK: one Marbles sample per Plaits block (#32)
 
 #include <atomic>
 #include <cmath>
@@ -84,7 +85,8 @@ float volt_buffer[kN * 4];
 stmlib::GateFlags no_clock[kN];          // no external clock, ever
 
 // ---- X / Y at 1 kHz (issue #22; sp1_marbles.h) ----
-const uint32_t kXYDecim = 4;                   // 4 kHz Plaits blocks per X/Y sample
+const uint32_t kXYDecim = SP1_SYNTH_BLOCKS_PER_MS;   // Plaits blocks per 1 kHz X/Y sample
+                                                     // (4 of 12 samples, 2 of 24; #32)
 const uint32_t kXYN = kN / kXYDecim;
 float xy_ramp_buffer[kXYN * 4];                // every 4th ramp sample (+ Y's divider)
 float xy_volt_buffer[kXYN * 4];
@@ -250,7 +252,8 @@ void Defaults(sp1_marbles_params* p) {
 
 namespace {
 void InitGenerators() {
-  const float sr = 4000.0f;   // one Marbles sample per 12-sample Plaits block
+  // One Marbles sample per Plaits block: 4 kHz at 12 samples, 2 kHz at 24 (#32).
+  const float sr = 48000.0f / static_cast<float>(SP1_SYNTH_BLOCK);
   t_generator.Init(&random_stream, sr);
   // X/Y run at 1 kHz (RenderXY1k). The rate only reaches XYGenerator's external-clock
   // extractor, which is never used; it is set to the truth anyway.
@@ -552,7 +555,8 @@ extern "C" void sp1_marbles_render(uint32_t n) {
   // (sp1_synth.h) and never touches the clock. The cap stays: it costs one compare and it
   // is the only thing standing between a future rate source and a runaway phase.
   const float range_k = c.t_range == 0 ? 0.5f : (c.t_range == 2 ? 8.0f : 2.0f);
-  const float max_st = 12.0f * log2f(4000.0f * 0.125f / range_k);
+  const float max_st = 12.0f * log2f(48000.0f / static_cast<float>(SP1_SYNTH_BLOCK) *
+                                     0.125f / range_k);
   float r = c.rate;
   if (!(r <= max_st)) {                // also catches NaN
     r = max_st;
@@ -752,4 +756,7 @@ extern "C" const char* sp1_marbles_scale_name(int s) {
 // The generators take the sample rate as a parameter; only the external-clock code
 // (ramp_extractor.cc, never called here) hard-codes 32 kHz. See sp1_marbles.h, "the 4 kHz rule".
 static_assert(SP1_MARBLES_MAX_FRAMES * 12u == 240u,
-              "one Marbles sample per Plaits block of a 240-frame audio block");
+              "one Marbles sample per Plaits block of a 240-frame audio block, at the "
+              "smallest Plaits block (12; at 24 a 240-frame block uses half of them)");
+static_assert(SP1_MARBLES_MAX_FRAMES % SP1_SYNTH_BLOCKS_PER_MS == 0u,
+              "whole 1 kHz X/Y groups");
