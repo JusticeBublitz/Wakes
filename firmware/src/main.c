@@ -92,6 +92,50 @@
 #include "sp1_release_guard.h"
 #include "sp1_midi.h"
 #endif
+#if defined(CONFIG_SP1_USB_AUDIO)
+#include "sp1_uac.h"
+#include "sp1_audio_gen.h"      /* config/audio.ini */
+#endif
+
+/* ---- USB audio out's level (M5c; config/audio.ini [usb] level) ----
+ * `parked`: while a host takes USB audio out (sp1_uac_live), VOL is set to audio.ini's
+ * parked_level and its buttons do nothing; when the host stops, VOL goes back to where the
+ * user left it. Wakes has ONE output level for every output, so this parks the headphones
+ * (and the speaker, if it is on) too -- deliberately: a separate USB level would be a second
+ * gain pass over every block (~0.3 % of the CPU, Adara: use this avenue instead). The level
+ * slews as VOL always does, so parking does not click. `vol`: nothing here happens.
+ * Across ON sessions the state stays, so a session started while a host records is parked
+ * on its first tick. */
+static bool vol_parked;
+#if defined(CONFIG_SP1_USB_AUDIO)
+static int vol_saved;
+
+static int usb_parked_db(void)
+{
+	return SP1_AUDIO_USB_PARKED_DB;
+}
+
+static void usb_level_park(bool usb_live)
+{
+	if (!SP1_AUDIO_USB_LEVEL_PARKED) {
+		return;
+	}
+	if (usb_live && !vol_parked) {
+		vol_saved = sp1_audio_level_get();
+		sp1_audio_level_step(SP1_AUDIO_USB_PARKED_STEP - vol_saved);
+		vol_parked = true;
+		printk("LEVEL parked at %d dBFS: a host takes USB audio out, VOL locked"
+		       " (config/audio.ini)\n", (int)SP1_AUDIO_USB_PARKED_DB);
+	} else if (!usb_live && vol_parked) {
+		sp1_audio_level_step(vol_saved - sp1_audio_level_get());
+		vol_parked = false;
+		printk("LEVEL back to step %d: no host takes USB audio out, VOL unlocked\n",
+		       vol_saved);
+	}
+}
+#else
+static int usb_parked_db(void) { return 0; }
+#endif
 
 #define WDT_NODE DT_ALIAS(watchdog0)
 
@@ -1039,12 +1083,21 @@ int main(void)
 			       (unsigned)CONFIG_I2S_NRFX_TX_BLOCK_COUNT,
 			       (unsigned)((CONFIG_I2S_NRFX_TX_BLOCK_COUNT + 3) *
 					  (CONFIG_SP1_AUDIO_BLOCK_FRAMES / 48)));
+#if defined(CONFIG_SP1_MIDI) && defined(CONFIG_SP1_USB_AUDIO)
+			/* M5c: the same count for USB audio out (sp1_midi.h): what the MIDI clock
+			 * makes up for while a host takes it. */
+			printk("AUD USB audio out: ~%u.%u ms in to out (speaker ~%u)\n",
+			       (unsigned)(SP1_MIDI_USB_OUTPUT_LATENCY_US / 1000),
+			       (unsigned)((SP1_MIDI_USB_OUTPUT_LATENCY_US % 1000) / 100),
+			       (unsigned)SP1_MIDI_OUTPUT_LATENCY_MS);
+#endif
 			/* #32: which USB path this build takes, so every log says it. */
-			printk("USB midi=%s  threads=%s\n",
+			printk("USB midi=%s  threads=%s  audio out=%s\n",
 			       IS_ENABLED(CONFIG_UDC_NRF_OUT_FAST) ? "in the interrupt (fast path)"
 								   : "usbd thread",
 			       sp1_usbd_threads_demoted() == 2 ? "below audio"
-							      : "above audio (stock)");
+							      : "above audio (stock)",
+			       IS_ENABLED(CONFIG_SP1_USB_AUDIO) ? "UAC1 48k/16/2, fast path" : "off");
 		}
 		sp1_playrow_reset();
 		uint32_t aud_print = 0;
@@ -1772,14 +1825,21 @@ int main(void)
 			/* ---- VOL-/VOL+: output level, 3 dB steps, slewed (no clicks) ----
 			 * Two steps is exactly one meter band (6.02 dB). Shifted, VOL is the
 			 * drive above instead, so this whole block stands down. */
-			if (!fnc && sp1_button_pressed(SP1_BTN_VOL_DOWN)) {
+			if (!fnc && vol_parked && (sp1_button_pressed(SP1_BTN_VOL_DOWN) ||
+						   sp1_button_pressed(SP1_BTN_VOL_UP))) {
+				/* config/audio.ini level = parked: a host is recording, so VOL stays
+				 * where audio.ini put it until the host stops (usb_level_park). */
+				printk("LEVEL locked at %d dBFS while a host takes USB audio out"
+				       " (config/audio.ini)\n", (int)usb_parked_db());
+			}
+			if (!fnc && !vol_parked && sp1_button_pressed(SP1_BTN_VOL_DOWN)) {
 				sp1_audio_level_step(+1);
 			}
-			if (!fnc && sp1_button_pressed(SP1_BTN_VOL_UP)) {
+			if (!fnc && !vol_parked && sp1_button_pressed(SP1_BTN_VOL_UP)) {
 				sp1_audio_level_step(-1);
 			}
-			if (!fnc && (sp1_button_pressed(SP1_BTN_VOL_DOWN) ||
-				     sp1_button_pressed(SP1_BTN_VOL_UP))) {
+			if (!fnc && !vol_parked && (sp1_button_pressed(SP1_BTN_VOL_DOWN) ||
+						    sp1_button_pressed(SP1_BTN_VOL_UP))) {
 				const int d = sp1_audio_level_db_x10();
 				if (d <= -9990) {
 					printk("LEVEL muted (step %d)\n",
@@ -1793,12 +1853,32 @@ int main(void)
 			}
 
 			/* ---- headphones in -> speaker off (M3) ---- */
+#if defined(CONFIG_SP1_USB_AUDIO)
+			{
+				const bool usb_live = sp1_uac_live();
+#if defined(CONFIG_SP1_MIDI)
+				/* M5c: the delay the MIDI clock makes up for is the path the host
+				 * hears -- USB audio out while a host takes it, the speaker /
+				 * headphones otherwise. */
+				sp1_midi_set_output_usb(usb_live);
+#endif
+				usb_level_park(usb_live);
+			}
+#endif
 			switch (sp1_audio_jack_poll(dt)) {
 			case 1:
 				printk("JACK headphones in: speaker off\n");
 				break;
 			case 0:
-				printk("JACK headphones out: speaker on\n");
+				/* Stays off while a host records USB audio out (event 3/4). */
+				printk("JACK headphones out: speaker %s\n",
+				       sp1_audio_speaker_on() ? "on" : "off");
+				break;
+			case 3:
+				printk("SPEAKER off: a host is taking USB audio out\n");
+				break;
+			case 4:
+				printk("SPEAKER on: no host is taking USB audio out\n");
 				break;
 			case 2:
 				printk("JACK detect failed 3x: disabled, speaker on\n");
@@ -2012,6 +2092,29 @@ int main(void)
 							       ms.lead_us / 1000u, (ms.lead_us % 1000u) / 100u);
 						}
 					}
+				}
+#endif
+#if defined(CONFIG_SP1_USB_AUDIO)
+				/* USB audio out (M5c), while the host has the stream open and once more
+				 * after it closes. Counts are since the stream opened (the ring's),
+				 * except replaced and sr (since boot). fill hovers near the target when
+				 * the clocks agree; 47s / 49s are the regulator following drift
+				 * (~10 a second at +/-200 ppm, none from load); under means a packet
+				 * went out silent, over a block found no room. */
+				{
+					static bool uac_was_open;
+					static uint32_t uac_opens_seen;
+					struct sp1_uac_stats us;
+					sp1_uac_get_stats(&us);
+					if (us.open || uac_was_open || us.opens != uac_opens_seen) {
+						printk("UAC open=%d opens=%u pkts=%u fill=%u (target %u)"
+						       " 47s=%u 49s=%u under=%u over=%u replaced=%u sr=%u\n",
+						       us.open ? 1 : 0, us.opens, us.packets, us.fill,
+						       us.target, us.n47, us.n49, us.under, us.over,
+						       us.replaced, us.sr_requests);
+					}
+					uac_was_open = us.open;
+					uac_opens_seen = us.opens;
 				}
 #endif
 			}

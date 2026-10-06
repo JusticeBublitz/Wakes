@@ -51,6 +51,11 @@ BUILD_ASSERT(BLK_FRAMES % 48u == 0u,
  * re-prime. tape-looper measured the structural peak at exactly queue + 3 (7 at 4). */
 K_MEM_SLAB_DEFINE_STATIC(tx_slab, BLK_BYTES, TX_QUEUE + 4, 4);
 
+#if defined(CONFIG_SP1_USB_AUDIO)
+#include "sp1_uac.h"        /* M5c: the same blocks, to the host */
+#include "sp1_audio_gen.h"  /* config/audio.ini: the speaker while a host takes them */
+#endif
+
 #if defined(CONFIG_SP1_MIDI)
 #include "sp1_midi.h"
 /* The MIDI clock leads by Wakes' own output delay (sp1_midi.h, SP1_MIDI_OUTPUT_LATENCY_MS),
@@ -113,6 +118,8 @@ static struct sp1_audio_stats st;
 static bool thread_made;
 
 static void jack_reset(void);   /* headphone detect, defined with its poll below */
+static bool speaker_wanted(void);       /* ditto */
+static bool speaker_driver(bool on);    /* ditto */
 static bool jack_enabled;       /* ditto; cleared by start() and stop() */
 
 /* Per-report window of block costs (M3): the max since boot is dominated by the one
@@ -229,6 +236,13 @@ static const int16_t TONE_AMP[SP1_LEVEL_STEPS] = {
 static const int16_t TONE_DB_X10[SP1_LEVEL_STEPS] = {
 	0, -30, -60, -90, -120, -151, -181, -211, -241, -271, -301, -9990,
 };
+/* config/audio.ini's parked_level is one of these steps, as tools/gen_audio.py knows them
+ * (0 .. -30 dB, 3 dB apart, then mute): parking USB audio out IS setting VOL (main.c). */
+BUILD_ASSERT(SP1_LEVEL_STEPS == 12, "VOL's steps changed: update VOL_STEPS in tools/gen_audio.py");
+#if defined(CONFIG_SP1_USB_AUDIO)
+BUILD_ASSERT(SP1_AUDIO_USB_PARKED_STEP >= 0 && SP1_AUDIO_USB_PARKED_STEP < SP1_LEVEL_STEPS - 1,
+	     "config/audio.ini parked_level is not one of VOL's steps");
+#endif
 
 static volatile bool tone_on;
 static volatile int  tone_step = SP1_LEVEL_DEFAULT;   /* the OUTPUT LEVEL step */
@@ -431,6 +445,12 @@ static void audio_thread(void *a, void *b, void *c)
 				continue;                     /* slept 100 ms; re-check stop */
 			}
 
+#if defined(CONFIG_SP1_USB_AUDIO)
+			/* M5c: this block's place on the audio clock, taken as its render starts --
+			 * the slot I2S just freed. USB audio's regulator steers on these claims, so
+			 * a long render is not mistaken for clock drift (sp1_uac_tuning.h). */
+			sp1_uac_claim(BLK_FRAMES);
+#endif
 			const uint32_t c0 = DWT->CYCCNT;
 #if defined(CONFIG_SP1_PROFILE_ICACHE)
 			const uint32_t m0 = NRF_NVMC->IMISS;
@@ -447,6 +467,10 @@ static void audio_thread(void *a, void *b, void *c)
 			win_sum += cyc;
 			win_n++;
 			account_sections(cyc, miss);
+#if defined(CONFIG_SP1_USB_AUDIO)
+			/* ...and the block itself, after VOL: what the codecs get, to the host. */
+			sp1_uac_push((const int16_t *)blk, BLK_FRAMES);
+#endif
 
 			if (i2s_write(i2s_dev, blk, BLK_BYTES) != 0) {
 				k_mem_slab_free(&tx_slab, blk);
@@ -765,6 +789,12 @@ int sp1_audio_start(void)
 
 	/* Speaker is ON after bring-up; the jack poll decides from here. */
 	jack_reset();
+	/* ...except that a host already recording USB audio (M5c) must not hear the first
+	 * 40 ms of this session on the speaker: mute now. A failed write is retried by the
+	 * first poll, which also counts it. */
+	if (jack_enabled && !speaker_wanted()) {
+		(void)speaker_driver(false);
+	}
 
 	return started ? 0 : -EIO;
 }
@@ -908,6 +938,18 @@ void sp1_audio_take_sections(struct sp1_audio_sections *out)
  *  Tim Knapen's sequence). DET_STATUS1 (0x1B77) bit 7 reads 1 while a plug is in.
  *  While it is, the TAS2505's class-D driver is powered down (page 1, reg 0x2D).
  *
+ *  M5c (Adara, 2026-10-05): the speaker is also off while a host is TAKING USB audio out --
+ *  unless config/audio.ini says `speaker = on` (SP1_AUDIO_USB_SPEAKER; default off)
+ *  (sp1_uac_live: the stream open AND packets going out since the last poll) -- recording
+ *  Wakes over USB, the speaker would only be a second, room copy. Anything short of that
+ *  defaults to the speaker (Adara): a charger, a host without USB audio or that rejects
+ *  ours, a host using only MIDI, one that has not opened the input, and one that opened it
+ *  and then went to sleep. Headphones are untouched: they still monitor. The jack is debounced as before;
+ *  the speaker is then reconciled on EVERY poll with what it should be doing
+ *  (speaker_wanted), so a stream closing -- the host stops, the cable is pulled -- brings
+ *  it back within one poll (40 ms). The USB mute rides on this same machinery and its
+ *  fail-safe: if detection gives up, the speaker is ON whether or not USB is streaming.
+ *
  *  ⚠️ FAIL-SAFE IS "SPEAKER ON". The one outcome this must never produce is a device
  *  that is silent with nothing plugged in. So:
  *    - the speaker is on after every bring-up, before the first read;
@@ -946,6 +988,18 @@ static bool speaker_driver(bool on)
 		spk_on = on;
 	}
 	return ok;
+}
+
+/* What the speaker should be doing: on, unless headphones are in or a host is taking USB
+ * audio out. An unknown jack (-1, before the first debounced read) counts as out. */
+static bool speaker_wanted(void)
+{
+#if defined(CONFIG_SP1_USB_AUDIO)
+	if (!SP1_AUDIO_USB_SPEAKER && sp1_uac_live()) {
+		return false;
+	}
+#endif
+	return jack_state != 1;
 }
 
 static void jack_reset(void)
@@ -988,27 +1042,37 @@ int sp1_audio_jack_poll(uint32_t elapsed_ms)
 		return jack_fail() ? 2 : -1;
 	}
 
+	/* The jack: a change needs JACK_DEBOUNCE identical reads in a row. */
+	int event = -1;
 	const int c = (v >> 7) & 1;
 	if (c != jack_cand) {
 		jack_cand = c;
 		jack_cnt = 1;
-		return -1;
-	}
-	if (jack_cnt < JACK_DEBOUNCE) {
+	} else if (jack_cnt < JACK_DEBOUNCE) {
 		jack_cnt++;
 	}
-	if (jack_cnt < JACK_DEBOUNCE || c == jack_state) {
-		return -1;
+	if (jack_cnt >= JACK_DEBOUNCE && c != jack_state) {
+		jack_state = c;
+		event = c;                            /* 1 in, 0 out */
 	}
-	/* Debounced change. Commit it only if the amp actually did what we asked. */
-	if (!speaker_driver(c == 0)) {
-		return jack_fail() ? 2 : -1;          /* retried on the next poll */
+
+	/* The speaker: whatever it should be doing, until the amp confirms it. `spk_on`
+	 * changes only when the write SUCCEEDED, so a failed one is simply retried on the
+	 * next poll (and counted). */
+	const bool want = speaker_wanted();
+	if (want != spk_on) {
+		if (!speaker_driver(want)) {
+			return jack_fail() ? 2 : event;
+		}
+		if (event < 0) {
+			event = want ? 4 : 3;             /* not the jack: USB audio closed / opened */
+		}
 	}
-	jack_state = c;
-	return c;
+	return event;
 }
 
 int sp1_audio_jack_state(void) { return jack_state; }
+bool sp1_audio_speaker_on(void) { return spk_on; }
 
 void sp1_audio_stats(struct sp1_audio_stats *out)
 {

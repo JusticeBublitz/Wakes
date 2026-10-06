@@ -19,7 +19,7 @@ REMEMBER: There is no way to go back to the base firmware once you've flashed it
 
 ## Status
 
-**v0.6.1, pre-release for beta testing.** Report problems with the bug form under [Issues](https://github.com/Worldwave/Wakes/issues).
+**v0.7.0, pre-release for beta testing.** Report problems with the bug form under [Issues](https://github.com/Worldwave/Wakes/issues).
 
 ## Flashing
 
@@ -61,6 +61,7 @@ Output: `build/zephyr/wakes-sp1.bin`. The Zephyr patch is required and is lost o
 | [`docs/DEFAULTS.md`](docs/DEFAULTS.md) | every default, and what a reset restores |
 | [`docs/MIDI.md`](docs/MIDI.md) | MIDI over USB: what it does, and how to change it |
 | [`config/midi.ini`](config/midi.ini) | the MIDI script: channel, legato, CC numbers (editable) |
+| [`config/audio.ini`](config/audio.ini) | USB audio out: its level (parked or on VOL) and the speaker while a host records (editable) |
 | [`docs/SAFETY.md`](docs/SAFETY.md) | rules for anyone changing the firmware |
 
 ## Licence
