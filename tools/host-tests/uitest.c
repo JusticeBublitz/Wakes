@@ -8,7 +8,8 @@
 #include "sp1_release_guard.h"
 
 /* ---- stubs for the parts that live in the audio thread ---- */
-uint8_t sp1_marbles_last_gates(void) { return 0u; }
+static uint8_t stub_gates;   /* t1..t3 as Marbles last rendered them (section 19) */
+uint8_t sp1_marbles_last_gates(void) { return stub_gates; }
 float sp1_marbles_last_volts(int k) { (void)k; return 0.0f; }
 float sp1_marbles_bpm(float rate, int r) { (void)r; return 120.0f * powf(2.0f, rate / 12.0f); }
 const char *sp1_marbles_model_name(int m)
@@ -841,6 +842,161 @@ int main(void)
 		sp1_mui_page_leds(page_lv);
 		CHECK(memcmp(shift_lv, page_lv, 4) == 0,
 		      "MARBLES page view differs from the ordinary view off SHIFT");
+	}
+
+	/* ---------- 18. GTLT on t SHIFT F1 (issue #20) ---------- */
+	printf("18. GTLT\n");
+	{
+		uint16_t f[4];
+		sp1_mui_init();
+		sp1_mui_routing(&r);
+		CHECK(r.gtlt == 0.0f, "GTLT does not boot disengaged: %.3f", r.gtlt);
+
+		/* "••" held on the t page = t SHIFT; F1 at mid is inside the detent */
+		sp1_mui_enter(raw_mid, true);
+		for (int i = 0; i < 100; i++) {
+			sp1_mui_tick(8u, raw_mid, true, true, false);
+		}
+		sp1_mui_routing(&r);
+		CHECK(r.gtlt == 0.0f, "F1 at mid is not on the detent: %.3f", r.gtlt);
+
+		memcpy(f, raw_mid, sizeof(f));
+		f[0] = 3701;                          /* F1 to the top */
+		for (int i = 0; i < 400; i++) {
+			sp1_mui_tick(8u, f, true, true, false);
+		}
+		sp1_mui_routing(&r);
+		sp1_mui_leds(lv);
+		printf("   F1 top: gtlt %+.3f, track row %s\n", r.gtlt, glyph(lv));
+		CHECK(r.gtlt > 0.99f, "F1 at the top should be tilt +1, got %.3f", r.gtlt);
+		CHECK(lv[0] >= 200u, "GTLT is not shown on T1 (still reserved?)");
+
+		f[0] = 0;                             /* and to the bottom */
+		for (int i = 0; i < 400; i++) {
+			sp1_mui_tick(8u, f, true, true, false);
+		}
+		sp1_mui_routing(&r);
+		CHECK(r.gtlt < -0.99f, "F1 at the bottom should be tilt -1, got %.3f", r.gtlt);
+
+		/* the X page's SHIFT F1 is still unbound: GTLT must not move from there */
+		sp1_mui_set_page(SP1_MUI_PAGE_X);
+		for (int i = 0; i < 400; i++) {
+			sp1_mui_tick(8u, raw_top, true, true, false);
+		}
+		sp1_mui_routing(&r);
+		CHECK(r.gtlt < -0.99f, "X SHIFT F1 moved GTLT: %.3f", r.gtlt);
+
+		sp1_mui_rip();
+		sp1_mui_routing(&r);
+		CHECK(r.gtlt == 0.0f, "a rip did not return GTLT to its detent: %.3f", r.gtlt);
+	}
+
+	/* ---------- 19. the t page's gate LEDs show GTLT's height (issue #20) ---------- */
+	printf("19. GTLT on the t LEDs\n");
+	{
+		uint16_t f[4];
+		const uint8_t floor8 = (uint8_t)(0.08f * 255.0f + 0.5f);
+		sp1_mui_init();
+		sp1_mui_enter(raw_mid, false);
+		for (int i = 0; i < 200; i++) {            /* > 1.2 s: no value overlay */
+			sp1_mui_tick(8u, raw_mid, true, false, false);
+		}
+		stub_gates = 0x7u;
+		sp1_mui_leds(lv);
+		CHECK(lv[0] == 255u && lv[1] == 255u && lv[2] == 255u,
+		      "GTLT on its detent should leave high gates full: %u %u %u",
+		      lv[0], lv[1], lv[2]);
+		stub_gates = 0x0u;
+		sp1_mui_leds(lv);
+		CHECK((lv[0] | lv[1] | lv[2]) == 0u, "low gates should be dark");
+
+		/* t SHIFT F1 to the top = tilt +1: t1 0 %, t2 untouched, t3 100 %. "••" goes
+		 * down first, then the fader moves, as a hand does (CATCH_LOCK takes the
+		 * finger's position at the layer change as its reference). */
+		for (int i = 0; i < 10; i++) {
+			sp1_mui_tick(8u, raw_mid, true, true, false);
+		}
+		memcpy(f, raw_mid, sizeof(f));
+		f[0] = 3701;
+		for (int i = 0; i < 400; i++) {
+			sp1_mui_tick(8u, f, true, true, false);
+		}
+		for (int i = 0; i < 200; i++) {            /* back to BASE, faders still */
+			sp1_mui_tick(8u, f, true, false, false);
+		}
+		stub_gates = 0x7u;
+		sp1_mui_leds(lv);
+		printf("   tilt +1, all gates high: %u %u %u (8 %% = %u)\n",
+		       lv[0], lv[1], lv[2], floor8);
+		CHECK(lv[0] == floor8, "t1 at 0 %% should show the 8 %% floor, got %u", lv[0]);
+		CHECK(lv[1] == 255u && lv[2] == 255u, "t2 / t3 should be full: %u %u",
+		      lv[1], lv[2]);
+		/* the same whether t1 goes to TRIG or nowhere (every output dims) */
+		sp1_mui_t_dest_step(0);
+		sp1_mui_leds(lv);
+		CHECK(lv[0] == floor8, "t1's LED should not depend on its routing: %u", lv[0]);
+		stub_gates = 0x0u;
+	}
+
+	/* ---------- 20. no bleed from SHIFT into BASE as "••" comes up (#20) ----------
+	 * Adara: a GTLT edit carried over into CLOK. The fader moves on SHIFT, "••" is released
+	 * with the finger still on it, before the low-pass has settled; then the finger rests
+	 * with a little jitter. The BASE value must not move. A real move afterwards must. */
+	printf("20. CATCH_LOCK: SHIFT edits stay on SHIFT\n");
+	{
+		uint16_t f[4];
+		struct sp1_marbles_params a, b;
+		sp1_mui_init();
+		sp1_mui_enter(raw_mid, false);
+		for (int i = 0; i < 100; i++) {
+			sp1_mui_tick(8u, raw_mid, true, false, false);
+		}
+		sp1_mui_params(&a);
+		memcpy(f, raw_mid, sizeof(f));
+		f[0] = 2961;                              /* GTLT up, quickly: 3 ticks */
+		for (int i = 0; i < 3; i++) {
+			sp1_mui_tick(8u, f, true, true, false);
+		}
+		for (int i = 0; i < 100; i++) {           /* "••" up, finger resting */
+			f[0] = (uint16_t)(2961 + ((i & 1) ? 15 : -15));
+			sp1_mui_tick(8u, f, true, false, false);
+		}
+		sp1_mui_params(&b);
+		printf("   MARBLES CLOK after a GTLT flick + release: %.4f -> %.4f st\n",
+		       a.rate, b.rate);
+		CHECK(b.rate == a.rate, "GTLT bled into CLOK: %.4f -> %.4f", a.rate, b.rate);
+		for (int i = 0; i < 100; i++) {           /* a real move on BASE */
+			sp1_mui_tick(8u, raw_top, true, false, false);
+		}
+		sp1_mui_params(&b);
+		CHECK(b.rate > a.rate + 1.0f, "a real CLOK move after the lock did nothing");
+
+		struct sp1_synth_params pa, pb;
+		sp1_pui_init();
+		sp1_pui_enter(raw_mid);
+		for (int i = 0; i < 100; i++) {
+			sp1_pui_tick(8u, raw_mid, true, false, false);
+		}
+		sp1_pui_params(&pa);
+		memcpy(f, raw_mid, sizeof(f));
+		f[1] = 3300;                              /* TIMBRE attenuverter, flicked */
+		for (int i = 0; i < 3; i++) {
+			sp1_pui_tick(8u, f, true, true, false);
+		}
+		for (int i = 0; i < 100; i++) {
+			f[1] = (uint16_t)(3300 + ((i & 1) ? 15 : -15));
+			sp1_pui_tick(8u, f, true, false, false);
+		}
+		sp1_pui_params(&pb);
+		printf("   PLAITS TIMBRE after a SHIFT flick + release: %.4f -> %.4f\n",
+		       pa.timbre, pb.timbre);
+		CHECK(pb.timbre == pa.timbre, "SHIFT F2 bled into TIMBRE: %.4f -> %.4f",
+		      pa.timbre, pb.timbre);
+		for (int i = 0; i < 100; i++) {
+			sp1_pui_tick(8u, raw_top, true, false, false);
+		}
+		sp1_pui_params(&pb);
+		CHECK(pb.timbre > pa.timbre + 0.1f, "a real TIMBRE move after the lock did nothing");
 	}
 
 	printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "all checks passed",

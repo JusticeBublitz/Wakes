@@ -239,13 +239,19 @@ and one SETTINGS page (Y) reached the same way as on PLAITS and identical from e
 | layer | how you get there | F1 | F2 | F3 | F4 |
 |---|---|---|---|---|---|
 | **t BASE** | T2 | **RATE** `[A]` (±5 oct) | **t BIAS** `[D]` * | **JITTER** `[C]` | **DEJA VU** `[H]` * |
-| **t SHIFT** | T2, then `••` held | *(free)* | **gate length** | **gate length randomness** | **LENGTH** `[I]` |
+| **t SHIFT** | T2, then `••` held | **GTLT** † * | **gate length** | **gate length randomness** | **LENGTH** `[I]` |
 | **X BASE** | T3 | **SPREAD** `[K]` | **X BIAS** `[L]` * | **STEPS** `[M]` * | **DEJA VU** `[H]` * |
 | **X SHIFT** | T3, then `••` held | *(free)* | *(free)* | *(free)* | **LENGTH** `[I]` |
 | **SETTINGS (Y)** | `••` double-tap | **Y SPREAD** | **Y BIAS** * | **Y STEPS** * | **Y divider** (12 steps) |
 
 \* 10 % centre detent. **DEJA VU's centre is LOCK**, not its bottom: below the centre the loop is
 recorded, above it the loop is replayed, at it the loop is frozen.
+
+† **GTLT** (#20), Wakes' own: tilts the HEIGHT of t1's and t3's gates around t2, which it never
+touches. At its detent it is off. Just past the detent both drop steeply to 50 %; towards + t1
+falls to 0 % and t3 returns to 100 %, towards − the reverse. **TRIG ignores it** — a t output on
+TRIG fires on every gate whatever GTLT says — so it only shapes t outputs routed to LEVEL, FM,
+TIMBRE, MORPH or HARMONICS.
 
 - **F4 is ONE control on both pages, not two that are kept in step.** Marbles has one DEJA VU
   knob and one LENGTH knob, so the X page's F4 addresses the t page's value rather than
@@ -401,7 +407,7 @@ is the most predictable starting point, and t1 / t3 are then yours to route.
 
 | | |
 |---|---|
-| **model row, BASE** | **Marbles' own output LEDs**: on the t page T1–T3 are the t1–t3 gates; on the X page they are \|X1\|…\|X3\| against the selected range. **T4 is always \|Y\|.** Moving a fader shows that page's four values instead, for 1.2 s. |
+| **model row, BASE** | **Marbles' own output LEDs**: on the t page T1–T3 are the t1–t3 gates, each lit at its GTLT height (0 % shows as 8 %); on the X page they are \|X1\|…\|X3\| against the selected range. **T4 is always \|Y\|.** Moving a fader shows that page's four values instead, for 1.2 s. |
 | **model row, SHIFT / SETTINGS** | that layer's four values; free faders read dark. SETTINGS breathes. |
 | **play row** | **Marbles' clock** in front, stepping once per t2 tick from the `••` end, with the dB meter behind it at ~10 %. (On PLAITS it is the other way round.) |
 
@@ -420,7 +426,6 @@ that has nothing on it. This is the supply side for M5 and M6.
 | where | what |
 |---|---|
 | PLAITS | a short `••` + T1, T2, T3 or T4 (held, each is UNPATCH) |
-| MARBLES | t SHIFT F1 |
 | MARBLES | X SHIFT F1, F2, F3 |
 | MARBLES | t SHIFT T4 |
 | MARBLES | `••` + FFWD / RWD on the t page and on SETTINGS |

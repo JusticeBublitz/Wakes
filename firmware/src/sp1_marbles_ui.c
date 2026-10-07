@@ -8,6 +8,7 @@
 
 #include "sp1_ui_timing.h"
 #include "sp1_midi.h"         /* MIDI CC offsets (M5a) */
+#include "sp1_gtlt.h"         /* GTLT's gain curve, for the t LEDs (#20) */
 
 #include <math.h>
 #include <stddef.h>
@@ -21,6 +22,11 @@
  * and the bug it is the second half of the fix for, is in sp1_plaits_ui.c -- kept there
  * because that is where the symptom was, and it is the same number for the same reason. */
 #define CATCH_JUMP        0.25f
+/* After a layer change a fader must move this far from where the finger is before its new
+ * parameter takes anything (pot_controller.h, POT_STATE_LOCKING's 0.03). Without it the
+ * low-pass tail of the last move, and a finger still resting on the fader, carried a GTLT
+ * edit into CLOK as the "••" came up (#20). Same rule in sp1_plaits_ui.c. */
+#define CATCH_LOCK        0.03f
 #define DETENT_BIPOLAR    0.10f
 #define TAP_MAX_MS        300u
 #define DOUBLE_TAP_MS     400u
@@ -104,6 +110,9 @@ static float stored[SP1_MUI_LAYERS][4];
 static bool  catching[SP1_MUI_LAYERS][4];
 static float pos[4];
 static float prev[4];
+static float now01[4];                     /* this tick's UNFILTERED positions    */
+static float lock_ref[4];                  /* where each finger was at the change */
+static bool  locked[4];                    /* inside CATCH_LOCK since that change */
 static float shown[4];                     /* fader positions last reflected      */
 static uint32_t show_ms;                   /* value overlay on BASE, counts down  */
 
@@ -139,7 +148,7 @@ static enum sp1_mui_layer canon(enum sp1_mui_layer l, int i)
 static const int8_t midi_dest[SP1_MUI_LAYERS][4] = {
 	[SP1_MUI_T_BASE]  = { SP1_MIDI_D_RATE, SP1_MIDI_D_T_BIAS, SP1_MIDI_D_JITTER,
 			      SP1_MIDI_D_DEJA_VU },
-	[SP1_MUI_T_SHIFT] = { -1, SP1_MIDI_D_GATE_LENGTH, SP1_MIDI_D_GATE_LENGTH_RANDOM,
+	[SP1_MUI_T_SHIFT] = { SP1_MIDI_D_GTLT, SP1_MIDI_D_GATE_LENGTH, SP1_MIDI_D_GATE_LENGTH_RANDOM,
 			      SP1_MIDI_D_LENGTH },
 	[SP1_MUI_X_BASE]  = { SP1_MIDI_D_SPREAD, SP1_MIDI_D_X_BIAS, SP1_MIDI_D_STEPS, -1 },
 	[SP1_MUI_X_SHIFT] = { -1, -1, -1, -1 },
@@ -208,6 +217,7 @@ static bool is_bipolar(enum sp1_mui_layer l, int i)
 {
 	switch (l) {
 	case SP1_MUI_T_BASE: return i == 1 || i == 3;
+	case SP1_MUI_T_SHIFT: return i == 0;             /* GTLT (issue #20) */
 	case SP1_MUI_X_BASE: return i >= 1;
 	case SP1_MUI_Y:      return i == 1 || i == 2;
 	default:             return false;
@@ -215,10 +225,11 @@ static bool is_bipolar(enum sp1_mui_layer l, int i)
 }
 
 /* Faders with nothing bound to them. They read dark and are ignored. X SHIFT F1 (was
- * SCALE) and F2 (was X CLOCK) joined the list in M4a -- see the header. */
+ * SCALE) and F2 (was X CLOCK) joined the list in M4a -- see the header. t SHIFT F1 left
+ * it when it became GTLT (issue #20). */
 static bool is_reserved(enum sp1_mui_layer l, int i)
 {
-	return (l == SP1_MUI_T_SHIFT && i == 0) || (l == SP1_MUI_X_SHIFT && i <= 2);
+	return l == SP1_MUI_X_SHIFT && i <= 2;
 }
 
 static enum sp1_mui_layer base_of(enum sp1_mui_page p)
@@ -233,12 +244,14 @@ static void activate(enum sp1_mui_layer l)
 		prev[i] = pos[i];
 		CAT(l, i) = fabsf(VAL(l, i) - pos[i]) >= CATCH_MATCH;
 		shown[i] = pos[i];
+		lock_ref[i] = now01[i];
+		locked[i] = true;
 	}
 }
 
 static void defaults_pages(void)
 {
-	stored[SP1_MUI_T_SHIFT][0] = 0.0f;
+	stored[SP1_MUI_T_SHIFT][0] = 0.5f;       /* GTLT on its detent: disengaged  */
 	stored[SP1_MUI_T_SHIFT][1] = 0.5f;       /* gate length 128/256 (Marbles)   */
 	stored[SP1_MUI_T_SHIFT][2] = 0.0f;       /* no randomness                   */
 	stored[SP1_MUI_T_SHIFT][3] = DEF_LENGTH;
@@ -333,6 +346,7 @@ void sp1_mui_enter(const uint16_t raw[4], bool fnc)
 {
 	for (int i = 0; i < 4; i++) {
 		pos[i] = to01(raw[i]);
+		now01[i] = pos[i];
 	}
 	fnc_was = fnc;
 	press_dirty = true;       /* a "••" already down is not a tap */
@@ -350,7 +364,8 @@ uint32_t sp1_mui_tick(uint32_t elapsed_ms, const uint16_t raw[4], bool valid,
 
 	if (valid) {
 		for (int i = 0; i < 4; i++) {
-			pos[i] += (to01(raw[i]) - pos[i]) * FADER_LP;
+			now01[i] = to01(raw[i]);
+			pos[i] += (now01[i] - pos[i]) * FADER_LP;
 		}
 	}
 
@@ -402,6 +417,16 @@ uint32_t sp1_mui_tick(uint32_t elapsed_ms, const uint16_t raw[4], bool valid,
 				 * rests, and catches up after the port goes (sp1_plaits_ui.c). */
 				prev[i] = pos[i];
 				CAT(active, i) = fabsf(*s - pos[i]) >= CATCH_MATCH;
+			} else if (locked[i]) {
+				/* Since the layer change: the filter's tail and a resting finger
+				 * are not movement (CATCH_LOCK). Tracking or catching up was decided
+				 * at the change and is NOT re-decided here: re-checking against a
+				 * fader that has already moved would put a tracking fader into
+				 * catch-up and leave its value short of the fader. */
+				prev[i] = pos[i];
+				if (fabsf(now01[i] - lock_ref[i]) > CATCH_LOCK) {
+					locked[i] = false;
+				}
 			} else if (!CAT(active, i)) {
 				*s = pos[i];
 				prev[i] = pos[i];
@@ -678,9 +703,19 @@ void sp1_mui_params(struct sp1_marbles_params *p)
 	p->y_range = range;   /* one [J] (M4e) */
 }
 
+/* GTLT (issue #20): -1..+1 past the 10 % detent, exactly 0 inside it. The curve and
+ * the TRIG exemption are in sp1_gtlt.h / sp1_synth.cc. Its CC is centred, like t BIAS:
+ * in `sum` it offsets the post-detent value, so a CC alone can engage it. */
+static float gtlt_tilt(void)
+{
+	return 2.0f * (clamp01(detent(stored[SP1_MUI_T_SHIFT][0], DETENT_BIPOLAR) +
+			       mo(SP1_MIDI_D_GTLT)) - 0.5f);
+}
+
 void sp1_mui_routing(struct sp1_mui_routing *out)
 {
 	*out = route;
+	out->gtlt = gtlt_tilt();
 }
 
 float sp1_mui_bpm(void)
@@ -703,9 +738,17 @@ static void leds_of(enum sp1_mui_layer l, uint8_t out[4])
 	if (base && show_ms == 0u) {
 		/* Marbles' own output LEDs; T4 = Y on both pages. */
 		if (page == SP1_MUI_PAGE_T) {
+			/* A high gate shows its HEIGHT under GTLT (#20), on every output whatever
+			 * it is routed to, from 8 % for a 0 % gate up to full (Adara: the floor is
+			 * "signal strength 0", so a gate still firing TRIG never goes dark). Low
+			 * gates are off. On the detent every gain is 1, so this is the old
+			 * on/off display exactly. */
 			const uint8_t g = sp1_marbles_last_gates();
+			const float tilt = gtlt_tilt();
 			for (int i = 0; i < 3; i++) {
-				out[i] = (g & (1u << i)) ? 255u : 0u;
+				const float x = SP1_GTLT_LED_FLOOR +
+					(1.0f - SP1_GTLT_LED_FLOOR) * sp1_gtlt_gain(tilt, i);
+				out[i] = (g & (1u << i)) ? (uint8_t)(x * 255.0f + 0.5f) : 0u;
 			}
 		} else {
 			for (int i = 0; i < 3; i++) {
