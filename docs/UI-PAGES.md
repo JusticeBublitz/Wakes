@@ -111,7 +111,7 @@ So the combination space is exactly: **`••` + one button**, on either ladder
 | **T2** | previous engine (flashes its glyph) | held 2 s: **UNPATCH TIMBRE** |
 | **T3** | next engine | held 2 s: **UNPATCH MORPH** |
 | **T4** | **swap module** → MARBLES | held 2 s: **UNPATCH HARMONICS** · a short press does nothing (output select moved to SETTINGS T4 in v0.4.6) |
-| **PLAY** | Marbles' clock **run / stop** | held 3 s: **rip out the cables** (see below) |
+| **PLAY** | Marbles' clock **run / stop** | **PRST**: a press shows the current slot (one LED, T1–T4, ramping at 10 Hz for 1.6 s); a press while it shows = the **next slot** (4 → 1), loaded at once; letting go of `••` leaves the browser and the page returns. Held 3 s from a press that did not change slot: **rip out the cables** (see below) |
 | **RWD** | one **TRIG** | **coarser** burst division |
 | **FFWD** | held: **burst** — re-triggers on the 1/div grid, running or stopped | **finer** burst division |
 | **VOL− / VOL+** | output level, 3 dB steps | **the soft-clip drive** — see below |
@@ -126,11 +126,20 @@ So the combination space is exactly: **`••` + one button**, on either ladder
   ⚠️ So FFWD now **re-triggers** the note Marbles is holding rather than making the sequence
   advance faster: a roll, not an arpeggio. Driving the clock at a subdivision instead is
   a separate option, parked for a community vote (Adara).
+- **Engines off the list** (#50): every build contains all of Plaits' engines; `config/engines.csv`
+  only decides which ones T2/T3 reach. A PRST slot may name one that is not listed, and it plays.
+  It has no glyph of its own, so its engine flash is all four face LEDs ramping 70 % → 0 at 15.6 Hz
+  for 0.7 s. From it, **T3 → the first listed engine, T2 → the last**; MIDI's MODEL CC counts from
+  list position 1. A name no engine of the build has loads list position 1.
 - **Rip out the cables** = `••` + PLAY held 3 s: a **full patch wipe** of the module on show
   (`docs/DEFAULTS.md` is the spec). On PLAITS: engine → slot 1, the four BASE faders → that
   engine's neutral state (0.5 for a bipolar parameter, 0 for a unipolar one, F1 → centre = C4),
   all four attenuverters → 0, SETTINGS → defaults, quantizer → off, output → OUT, division → 1/32.
-  The row flickers twice, fades to black, and only commits at 3 s; letting go earlier cancels.
+  The row shows the PRST slot glyph for 1.6 s, goes black for 0.25 s, rises to full over 0.4 s,
+  then plays the Unpatch animation and commits at 3 s (#50); letting go once it is past the glyph
+  cancels and returns to the SHIFT screen. After a PRST slot change in the same `••` hold it does
+  not start at all until `••` is released. With PRST off (no filesystem) there is no glyph: the
+  first 1.6 s are a slow fade of the face LEDs to black (Adara), then the same; a press is ROTC only.
   ⚠️ Until M4b this kept the engine and BASE and was a modulation reset. It is a patch wipe now.
   ⚠️ **The faders do not move** — pickup catches them up on the next touch, so straight after a
   rip the instrument sounds neutral while the faders still look wrong. By design.
@@ -287,7 +296,7 @@ TIMBRE, MORPH or HARMONICS.
 | **`••` + T1 / T2 / T3** | **t1 / t2 / t3 destination** · held 2 s: **UNPATCH** that output | **X1 / X2 / X3 destination** · held 2 s: **UNPATCH** that output | — |
 | **`••` + T4** | **Y destination** · held 2 s: **UNPATCH Y** | **Y destination** · held 2 s: **UNPATCH Y** | — |
 | **`••` + FFWD / RWD** | *(free)* | **next / previous scale**, no wrap, excluded scales skipped | *(free)* |
-| **`••` + PLAY** | held 3 s: **rip out the cables** | the same | the same |
+| **`••` + PLAY** | PRST slot / next slot; held 3 s: **rip out the cables** | the same | the same |
 | **VOL− / VOL+** | output level | output level | output level |
 
 ⚠️ **T4 is `[J]` on the SETTINGS page, so the module swap is unavailable there.** Tap `••` once
@@ -391,7 +400,7 @@ internal envelope between gates and the attenuverter would change meaning severa
 | | |
 |---|---|
 | routing at **boot** | **t2 → TRIG** (the master clock, so every tick fires a note — the most predictable "press PLAY and hear something" default, with no rhythmic randomness); **X1 → V/Oct**; everything else → none |
-| routing after a **rip** | **everything → none.** "Rip out the cables" means what it says, so PLAY makes no sound until something is dialled back in |
+| routing after a **rip** | **t2 → TRIG, X2 → V/Oct**, everything else → none (#50; through v0.7.2 a rip cleared everything). X2 on V/Oct turns the PLAITS quantizer off, as routing it by hand does |
 | a rip also | **re-seeds and re-draws the DEJA VU loop**, and **leaves the clock running** — its phase jumps once. Every t and X BASE fader resets; the page you are standing on is kept |
 | t | coin toss, ×1 range, RATE centre = **120 BPM**, BIAS centre, no jitter, DEJA VU locked |
 | X | SPREAD centre, BIAS centre, STEPS 0.66 (so X is quantized and Y is not), DEJA VU locked, `[J]` **INTELLIGENT** (X and Y), identical diversity, **major** |

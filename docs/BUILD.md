@@ -23,6 +23,20 @@ Artifact: **`build\zephyr\wakes-sp1.bin`**. (`CONFIG_KERNEL_BIN_NAME="wakes-sp1"
 `firmware/prj.conf` renames the outputs from Zephyr's default `zephyr.*`. The
 `build\zephyr\` directory name itself comes from the CMake target and is unaffected.)
 
+### The three images
+
+| Image | Build | eMMC |
+|---|---|---|
+| `wakes-sp1.bin` | as above | storage + drive mode; **never formats** (no formatter is linked) |
+| `wakes-sp1-fresh.bin` | add `-DCONFIG_SP1_FRESH=y` after the `--` | **formats the eMMC** on its first ON, once per build |
+| fallback | add `-DCONFIG_SP1_PLAITS=n` | test tone, recovery only; never touches the eMMC |
+
+The fresh build still writes `build\zephyr\wakes-sp1.bin`: **rename it to
+`wakes-sp1-fresh.bin` straight away**, so it is never flashed by mistake as the image that
+does not format. CI does the same, and checks each image's `.config` against its name.
+Storage diagnostics, off in every shipped image: `-DCONFIG_SP1_STORAGE_TEST=y` (eMMC report
++ a 512 KB pattern test on each ON) and `-DCONFIG_SP1_EMMC_VERIFY=y` (every write read back).
+
 ### Three things that are not optional
 
 **Quote `BOARD_ROOT` and use forward slashes.** Unquoted, the argument splits at the
@@ -83,7 +97,7 @@ The failure modes that recur on this board:
 | a `pwm*`/`adc` node not found | the DTS label, and that the matching `CONFIG_*` driver is enabled |
 | `zephyr,deferred-init` unknown property, or `device_init()` undeclared | see **Deferred PWM init** below — there is a fallback |
 | pinctrl error on a `PSEL` | spelling in `stem_player-pinctrl.dtsi` |
-| missing module | `west.yml`'s allowlist — `cmsis`, `cmsis_6`, `hal_nordic` are all required |
+| missing module | `west.yml`'s allowlist — `cmsis`, `cmsis_6`, `fatfs`, `hal_nordic` are all required |
 | **LEDs work but wrong ones, or wrong order** | **not a build error.** pinctrl channel order vs LED index — see the comment block in `sp1_board.h` |
 | **ADC reads nonsense** | **not a build error.** Channel `reg` vs `io-channels` index vs the index used in C |
 
@@ -261,6 +275,7 @@ git config --global --add safe.directory C:/sp1-ws/zephyr
 git config --global --add safe.directory C:/sp1-ws/modules/hal/cmsis
 git config --global --add safe.directory C:/sp1-ws/modules/hal/cmsis_6
 git config --global --add safe.directory C:/sp1-ws/modules/hal/nordic
+git config --global --add safe.directory C:/sp1-ws/modules/fs/fatfs
 git config --global --add safe.directory C:/sp1-ws/wakes-sp1
 ```
 

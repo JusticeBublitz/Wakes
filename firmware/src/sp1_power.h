@@ -69,6 +69,10 @@ bool sp1_fnc_pressed(void);
  * left DISARMED until "••" is released, so a continuous press cannot roll from
  * power-on straight into power-off.
  *
+ * With CONFIG_SP1_DRIVE, every block the computer reads or writes restarts the fill, so
+ * ON needs SP1_PWR_ON_FILL_MS without a transfer (M6, #43): turning ON takes the card
+ * from the computer. No time limit; the hold blocks for as long as the transfers last.
+ *
  * Does not power anything off; the caller decides what an early release means. */
 bool sp1_power_on_hold(void);
 
@@ -115,6 +119,13 @@ enum sp1_power_result {
  * quiesces the peripherals, disarms the gesture and returns SP1_PWR_TO_STANDBY --
  * no reset is involved, the device is simply already awake. */
 enum sp1_power_result sp1_power_tick(uint32_t elapsed_ms, bool fnc_held);
+
+/* ---- PRST's save at shutdown (M6, #50) ----
+ * Called once when the ordinary shutdown animation COMPLETES, before the peripherals are
+ * quiesced -- on the way to STANDBY and to SYSTEM_OFF alike. Never from the 30 s backstop:
+ * the forced power-off does not wait for a save (rule 5a). The hook itself must be bounded
+ * and feed the watchdog (main.c's waits at most 4 s). NULL = none. */
+void sp1_power_set_save_hook(void (*fn)(void));
 
 /* Tell the shutdown gesture that "••" was used as a modifier during this hold.
  * Suppresses shutdown until "••" is released.

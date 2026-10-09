@@ -13,6 +13,9 @@
 #include "sp1_led.h"
 #include "sp1_ui_timing.h"
 #include "sp1_audio.h"
+#if defined(CONFIG_SP1_STORAGE)
+#include "sp1_store.h"
+#endif
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
@@ -131,6 +134,13 @@ void sp1_quiesce_peripherals(void)
 	 * on every power-off path, and rule 5a says power-off does not wait on anything
 	 * else succeeding. Safe when audio was never started. */
 	sp1_audio_stop();
+
+#if defined(CONFIG_SP1_STORAGE)
+	/* M6 (#43): stop the storage thread's eMMC job and release the card's bus pins
+	 * BEFORE its rail goes, so nothing drives an unpowered card. Never waits: a job cut
+	 * short just fails its remaining steps (sp1_store.h). */
+	sp1_store_abort();
+#endif
 
 	/* The speaker amp, headphone codec, audio oscillator and eMMC I/O rail are
 	 * separate chips held up by retained GPIO levels. Leaving them powered is
@@ -309,6 +319,17 @@ static void gesture_reset(void)
 bool sp1_power_on_hold(void)
 {
 	uint32_t held = 0u;
+#if defined(CONFIG_SP1_DRIVE)
+	/* Drive mode (M6, #43, Adara): while the computer reads or writes the card, ON
+	 * would take the card from under it, so every transfer restarts the FILL (not the
+	 * dark window). ON needs SP1_PWR_ON_FILL_MS of quiet with "••" held. Only real block
+	 * transfers count (sp1_store_activity), never the host's "medium?" polls, so an idle
+	 * computer delays nothing. No time limit, deliberately (Adara): a limit would undo
+	 * the protection, and eject or unplug always ends the transfers.
+	 * ⚠️ Delays power-ON only. Power-off and the 30 s backstop are not in this path. */
+	uint32_t act_seen = sp1_store_activity();
+	uint32_t held_back = 0u;
+#endif
 
 	/* DO NOT initialise the LEDs here. The PWM devices are deferred-init, so
 	 * during the silent window their pins are still untouched -- and that, not
@@ -367,6 +388,17 @@ bool sp1_power_on_hold(void)
 			return false;
 		}
 
+#if defined(CONFIG_SP1_DRIVE)
+		const uint32_t act = sp1_store_activity();
+		if (act != act_seen) {
+			act_seen = act;
+			if (held > SP1_PWR_ON_DARK_MS) {
+				held = SP1_PWR_ON_DARK_MS;   /* the fill starts again */
+				held_back++;
+			}
+		}
+#endif
+
 		if (held >= SP1_PWR_ON_DARK_MS) {
 			/* Past the silent window: now it is safe to claim the pins.
 			 * Idempotent, so this costs nothing after the first tick. */
@@ -397,6 +429,13 @@ bool sp1_power_on_hold(void)
 		held += SP1_TICK_MS;
 	}
 
+#if defined(CONFIG_SP1_DRIVE)
+	if (held_back > 0u) {
+		printk("PWR power-on fill restarted %u x by the computer's transfers\n",
+		       held_back);
+	}
+#endif
+
 	/* Accepted, so the device is booting: make sure the rows are up even if the
 	 * fill never ran (it always does, but do not depend on that). */
 	(void)sp1_led_init();
@@ -418,6 +457,13 @@ void sp1_power_on_gate(void)
 	if (!sp1_power_on_hold()) {
 		sp1_power_off();          /* never returns */
 	}
+}
+
+static void (*save_hook)(void);
+
+void sp1_power_set_save_hook(void (*fn)(void))
+{
+	save_hook = fn;
 }
 
 enum sp1_power_result sp1_power_tick(uint32_t elapsed_ms, bool fnc_held)
@@ -571,7 +617,16 @@ enum sp1_power_result sp1_power_tick(uint32_t elapsed_ms, bool fnc_held)
 				 * Plugged in, the destination is STANDBY, not
 				 * SYSTEM_OFF -- and no reset is needed, because we
 				 * are already awake. Unplugged, it is a real
-				 * SYSTEM_OFF. */
+				 * SYSTEM_OFF.
+				 *
+				 * PRST (M6, #50): the save goes HERE, after the
+				 * animation and before anything is powered down --
+				 * and ONLY here. The 30 s backstop above never calls
+				 * it (rule 5a: the forced power-off never waits for a
+				 * save), and the hook is bounded (4 s, main.c). */
+				if (save_hook != NULL) {
+					save_hook();
+				}
 				if (sp1_usb_present()) {
 					sp1_quiesce_peripherals();
 					gesture_reset();
